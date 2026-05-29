@@ -8,22 +8,16 @@ See [ralph-prd.md](ralph-prd.md) for detailed documentation.
 
 ```bash
 npm install github:jtrod/ralph
-ralph init
+npx ralph PROJECT.md
 ```
 
-`ralph init` scaffolds `PROMPT.md` and installs the `/prd` command into `.claude/commands/prd.md`. Both are required before running ralph.
-
-Then in Claude Code, run `/prd` to generate your `PROJECT.md`:
+Ralph auto-scaffolds `PROMPT.md` and the `/prd` command on first run. Before running ralph, generate your PROJECT.md in Claude Code:
 
 ```
 /prd "describe your project here"
 ```
 
-Then start the loop:
-
-```bash
-ralph PROJECT.md
-```
+Or run `npx ralph init` to scaffold without starting the loop.
 
 ## Usage
 
