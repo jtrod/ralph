@@ -17,7 +17,8 @@
         "node": ">=18"
     },
     "scripts": {
-        "test": "node --test"
+        "test": "node --test",
+        "postinstall": "node bin/setup.js"
     },
     "dependencies": {
         "blessed": "^0.1.81",
