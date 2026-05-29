@@ -1,0 +1,31 @@
+{
+    "name": "ralph",
+    "version": "1.0.0",
+    "description": "Drive an iterative `claude -p` loop against a PRD/PROJECT file with a live TUI.",
+    "type": "module",
+    "bin": {
+        "ralph": "bin/ralph.js"
+    },
+    "files": [
+        "bin",
+        "lib",
+        "templates",
+        "ralph.sh",
+        "README.md"
+    ],
+    "engines": {
+        "node": ">=18"
+    },
+    "scripts": {
+        "test": "node --test"
+    },
+    "dependencies": {
+        "blessed": "^0.1.81",
+        "blessed-contrib": "^4.11.0"
+    },
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/jtrod/ralph.git"
+    },
+    "license": "MIT"
+}
