@@ -6,25 +6,23 @@ See [ralph-prd.md](ralph-prd.md) for detailed documentation.
 
 ## Quick Start
 
-### Install globally
-
 ```bash
 npm i -g github:jtrod/ralph
 ralph init
 ```
 
-### Use in a project
+`ralph init` scaffolds `PROMPT.md` and installs the `/prd` command into `.claude/commands/prd.md`. Both are required before running ralph.
 
-```bash
-npm i -D github:jtrod/ralph
-npx ralph PROJECT.md
+Then in Claude Code, run `/prd` to generate your `PROJECT.md`:
+
+```
+/prd "describe your project here"
 ```
 
-### Run once
+Then start the loop:
 
 ```bash
-npx github:jtrod/ralph init
-npx github:jtrod/ralph PROJECT.md 10 --budget 5
+ralph PROJECT.md
 ```
 
 ## Usage
