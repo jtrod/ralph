@@ -18,16 +18,13 @@ See [ralph-prd.md](ralph-prd.md) for detailed documentation.
 
 3. **Start the loop:**
    ```bash
-   npx ralph PROJECT.md
+   npx ralph example_prd.md
    ```
-
-Ralph auto-scaffolds `PROMPT.md` and the `/prd` command on first run, so you don't need to manually run `ralph init`.
 
 ## Usage
 
 ```bash
 ralph <prd-file> [iterations=10] [--budget <usd>]
-ralph init
 ```
 
 **Arguments:**
