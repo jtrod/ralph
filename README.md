@@ -7,7 +7,7 @@ See [ralph-prd.md](ralph-prd.md) for detailed documentation.
 ## Quick Start
 
 ```bash
-npm i github:jtrod/ralph
+npm install github:jtrod/ralph
 ralph init
 ```
 
