@@ -10,6 +10,7 @@ import {
     classifyFileOp, parseTestOutput, parseGitDiffStat,
     computeEta, computeBurnRate, summarizeToolUse,
     parsePrdTasksFromContent,
+    groupTasksIntoWaves, buildBranchName,
 } from '../lib/ralph-utils.js';
 
 describe('formatElapsed', () => {
@@ -403,6 +404,76 @@ Just prose, no tasks here.
     });
 });
 
+describe('groupTasksIntoWaves', () => {
+    const task = (id, group, done = false) => ({ id, title: id, group, done });
+
+    it('returns empty array for no tasks', () => {
+        assert.deepEqual(groupTasksIntoWaves([]), []);
+    });
+
+    it('groups same-group tasks into one wave and preserves group order', () => {
+        const tasks = [
+            task('T1', 'W1'), task('T2', 'W1'),
+            task('T3', 'W2'),
+        ];
+        const waves = groupTasksIntoWaves(tasks);
+        assert.equal(waves.length, 2);
+        assert.equal(waves[0].group, 'W1');
+        assert.deepEqual(waves[0].tasks.map(t => t.id), ['T1', 'T2']);
+        assert.equal(waves[1].group, 'W2');
+        assert.deepEqual(waves[1].tasks.map(t => t.id), ['T3']);
+    });
+
+    it('drops done tasks before forming waves', () => {
+        const tasks = [task('T1', 'W1', true), task('T2', 'W1'), task('T3', 'W2', true)];
+        const waves = groupTasksIntoWaves(tasks);
+        assert.equal(waves.length, 1);
+        assert.deepEqual(waves[0].tasks.map(t => t.id), ['T2']);
+    });
+
+    it('chunks an oversized group into back-to-back sub-waves of the same group', () => {
+        const tasks = Array.from({ length: 7 }, (_, n) => task(`T${n + 1}`, 'W1'));
+        const waves = groupTasksIntoWaves(tasks, 3);
+        assert.equal(waves.length, 3);
+        assert.deepEqual(waves.map(w => w.tasks.length), [3, 3, 1]);
+        assert.ok(waves.every(w => w.group === 'W1'));
+    });
+
+    it('makes each ungrouped task its own singleton wave', () => {
+        const tasks = [task('T1', ''), task('T2', '')];
+        const waves = groupTasksIntoWaves(tasks);
+        assert.equal(waves.length, 2);
+        assert.ok(waves.every(w => w.tasks.length === 1));
+    });
+
+    it('does not merge non-adjacent same-group tasks across an ungrouped one', () => {
+        const tasks = [task('T1', 'W1'), task('T2', ''), task('T3', 'W1')];
+        const waves = groupTasksIntoWaves(tasks);
+        assert.deepEqual(waves.map(w => w.tasks.map(t => t.id)), [['T1'], ['T2'], ['T3']]);
+    });
+});
+
+describe('buildBranchName', () => {
+    it('slugifies the title', () => {
+        assert.equal(buildBranchName('T1', 'Create the User model'), 'ralph/T1-create-the-user-model');
+    });
+
+    it('collapses non-alphanumerics and trims dashes', () => {
+        assert.equal(buildBranchName('T2', '  Add /routes & wiring!! '), 'ralph/T2-add-routes-wiring');
+    });
+
+    it('falls back to id-only for an empty or symbol-only title', () => {
+        assert.equal(buildBranchName('T3', ''), 'ralph/T3');
+        assert.equal(buildBranchName('T4', '***'), 'ralph/T4');
+    });
+
+    it('caps slug length and uses only the safe charset', () => {
+        const name = buildBranchName('T5', 'x'.repeat(100));
+        assert.match(name, /^ralph\/T5-[a-z0-9-]+$/);
+        assert.ok(name.length <= 'ralph/T5-'.length + 40);
+    });
+});
+
 // ─── CLI Command Tests ──────────────────────────────────────────────────────
 
 const BIN = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'ralph.js');
@@ -495,6 +566,25 @@ describe('ralph CLI', () => {
         const { code, stderr } = run('PROMPT.md', '5', '--budget', '10.00');
         assert.equal(code, 2);
         assert.match(stderr, /requires a TTY/);
+    });
+
+    it('documents --parallel in help', () => {
+        const { code, stdout } = run('--help');
+        assert.equal(code, 0);
+        assert.match(stdout, /--parallel/);
+        assert.match(stdout, /--max-parallel/);
+    });
+
+    it('accepts --parallel with valid args (still fails on TTY)', () => {
+        const { code, stderr } = run('PROMPT.md', '--parallel');
+        assert.equal(code, 2);
+        assert.match(stderr, /requires a TTY/);
+    });
+
+    it('errors on --max-parallel with a non-positive value', () => {
+        const { code, stderr } = run('PROMPT.md', '--max-parallel', '0');
+        assert.equal(code, 2);
+        assert.match(stderr, /--max-parallel must be a positive integer/);
     });
 });
 

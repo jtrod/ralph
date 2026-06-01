@@ -304,6 +304,8 @@ Break the implementation plan into atomic, sequentially executable tasks. Each t
 - Prefix each task with a unique ID: `**T1:**`, `**T2:**`, etc.
 - Group tasks under **level-3** wave/phase headers (`### W1: Foundation`, `### W2: Components`, etc.) — these stay at level-3 so they nest inside `## Tasks`.
 - Order tasks by dependency — earlier tasks must not depend on later ones
+- **Parallel-safety (matters when ralph runs with `--parallel`):** tasks under the **same** `### Wn` group run **concurrently**, each in its own git worktree, and are merged back one at a time. Therefore same-group tasks **MUST touch disjoint files** — no two tasks in one group may create, modify, or delete the same file (a shared file causes a merge conflict and forces a slow sequential retry). Cross-group dependencies are fine because groups run in order; intra-group dependencies are forbidden. If two tasks must edit the same file or one depends on the other, put them in **different** groups.
+- Do **not** have tasks edit the PRD/PROJECT file or `PROGRESS.md` themselves. In `--parallel` mode ralph is the sole writer of task check-offs and progress entries (it records them after a successful merge); in sequential mode the agent still updates them per `PROMPT.md`.
 - Each task must be self-contained: state exactly which files to create, modify, or delete
 - Include the verification command at the end of each task (e.g., "Run `npm run build` to verify.")
 - Keep each task small enough for one `claude -p` iteration (create/modify 1–5 files)
