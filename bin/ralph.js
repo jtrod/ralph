@@ -2,7 +2,7 @@
 
 import blessed from 'blessed';
 import contrib from 'blessed-contrib';
-import { spawn, execSync } from 'node:child_process';
+import { spawn, execSync, execFileSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
@@ -13,6 +13,8 @@ import {
     classifyFileOp, parseTestOutput, parseGitDiffStat,
     computeEta, computeBurnRate, summarizeToolUse,
     parsePrdTasksFromContent,
+    groupTasksIntoWaves, buildBranchName, DEFAULT_WAVE_CAP,
+    TASK_LINE_RE, CHECKBOX_LINE_RE,
 } from '../lib/ralph-utils.js';
 
 const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -27,10 +29,14 @@ const MAX_LOG_ENTRIES = 10_000;
 const LOG_FILTERS = ['all', 'tool', 'error', 'text'];
 
 const STATE = {
-    child: null,
+    children: new Map(),
     canceled: false,
     skipped: false,
     paused: false,
+    parallel: false,
+    maxParallel: 0,
+    wave: null,
+    waveLabel: '',
     iter: 0,
     maxIters: 0,
     iterStartedAt: 0,
@@ -65,7 +71,7 @@ const STATE = {
 // ─── CLI ────────────────────────────────────────────────────────────────────
 
 function printUsage(stream) {
-    (stream ?? process.stdout).write(`Usage: ralph <prd-file> [iterations=10] [--budget <usd>]
+    (stream ?? process.stdout).write(`Usage: ralph <prd-file> [iterations=10] [--budget <usd>] [--parallel]
        ralph init
 
 Drive an iterative claude -p loop against a PRD file with a live TUI.
@@ -76,11 +82,18 @@ Commands:
 
 Arguments:
   <prd-file>    Path to the PRD/project file the agent will read and update.
-  iterations    Max iterations before giving up. Default: 10.
+  iterations    Max iterations before giving up (sequential mode). Default: 10.
 
 Options:
-  --budget <n>  Max USD to spend. Auto-pauses when exceeded.
-  -h, --help    Print this help and exit.
+  --budget <n>       Max USD to spend. Auto-pauses when exceeded.
+  --parallel         Run each work group (### Wn) as a concurrent wave: tasks
+                     in a group run at once in isolated git worktrees, then
+                     merge back one at a time with a test gate. Requires a git
+                     repo and a clean working tree. Same-group tasks must touch
+                     disjoint files. Default is sequential.
+  --max-parallel <n> Cap concurrent agents per wave (implies --parallel).
+                     Default: ${DEFAULT_WAVE_CAP}.
+  -h, --help         Print this help and exit.
 
 Keys (inside the TUI):
   q  Quit           c  Cancel iteration    s  Skip iteration
@@ -116,6 +129,8 @@ function parseArgs(argv) {
     if (raw.includes('-h') || raw.includes('--help')) return { help: true };
 
     let budget = null;
+    let parallel = false;
+    let maxParallel = DEFAULT_WAVE_CAP;
     const positional = [];
 
     for (let i = 0; i < raw.length; i++) {
@@ -124,6 +139,18 @@ function parseArgs(argv) {
             if (isNaN(budget) || budget <= 0) {
                 return { error: `--budget must be a positive number, got: ${raw[i]}` };
             }
+            continue;
+        }
+        if (raw[i] === '--parallel') {
+            parallel = true;
+            continue;
+        }
+        if (raw[i] === '--max-parallel') {
+            maxParallel = Number(raw[++i]);
+            if (!Number.isInteger(maxParallel) || maxParallel <= 0) {
+                return { error: `--max-parallel must be a positive integer, got: ${raw[i]}` };
+            }
+            parallel = true;
             continue;
         }
         positional.push(raw[i]);
@@ -139,7 +166,7 @@ function parseArgs(argv) {
         return { error: `iterations must be a positive integer, got: ${itersRaw}` };
     }
 
-    return { prdPath, maxIters, budget };
+    return { prdPath, maxIters, budget, parallel, maxParallel };
 }
 
 function buildPromptBody(prdPath) {
@@ -191,13 +218,175 @@ function trackFileOp(filePath, op) {
 
 // ─── Git Diff ───────────────────────────────────────────────────────────────
 
-function fetchGitDiffStat() {
+function fetchGitDiffStat(cwd = process.cwd()) {
     try {
-        const out = execSync('git diff --shortstat HEAD', { timeout: 5000, encoding: 'utf8' });
+        const out = execSync('git diff --shortstat HEAD', { timeout: 5000, encoding: 'utf8', cwd });
         return parseGitDiffStat(out);
     } catch (_) {
         return null;
     }
+}
+
+// ─── Git Worktree Lifecycle (parallel mode) ─────────────────────────────────
+//
+// All git calls use execFileSync with an argument array (no shell), so branch
+// names and paths can never be interpreted as shell metacharacters.
+
+const GIT_TIMEOUT_MS = 120_000;
+const TEST_TIMEOUT_MS = 600_000;
+
+function git(args, cwd = process.cwd()) {
+    return execFileSync('git', args, { encoding: 'utf8', cwd, timeout: GIT_TIMEOUT_MS });
+}
+
+// Run git without throwing; returns { ok, out }. ok reflects a zero exit code.
+function gitTry(args, cwd = process.cwd()) {
+    try {
+        return { ok: true, out: git(args, cwd) };
+    } catch (err) {
+        return { ok: false, out: `${err.stdout ?? ''}${err.stderr ?? ''}` };
+    }
+}
+
+function isGitRepo(cwd = process.cwd()) {
+    return gitTry(['rev-parse', '--is-inside-work-tree'], cwd).ok;
+}
+
+function isWorkingTreeClean(cwd = process.cwd()) {
+    const r = gitTry(['status', '--porcelain'], cwd);
+    return r.ok && r.out.trim() === '';
+}
+
+function currentBranch(cwd = process.cwd()) {
+    return git(['rev-parse', '--abbrev-ref', 'HEAD'], cwd).trim();
+}
+
+function detectTestCommand(cwd = process.cwd()) {
+    try {
+        const pkg = JSON.parse(fs.readFileSync(path.join(cwd, 'package.json'), 'utf8'));
+        return Boolean(pkg.scripts?.test);
+    } catch (_) {
+        return false;
+    }
+}
+
+function runTests(cwd = process.cwd()) {
+    try {
+        const out = execFileSync('npm', ['test'], {
+            encoding: 'utf8', cwd, timeout: TEST_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        return { ok: true, out };
+    } catch (err) {
+        return { ok: false, out: `${err.stdout ?? ''}${err.stderr ?? ''}` };
+    }
+}
+
+// Stage and commit everything in a worktree (guards against an agent that edits
+// files but forgets to commit). Returns true if a commit was created.
+function commitAll(cwd, message) {
+    gitTry(['add', '-A'], cwd);
+    const nothingStaged = gitTry(['diff', '--cached', '--quiet'], cwd).ok;
+    if (!nothingStaged) gitTry(['commit', '-m', message], cwd);
+    return !nothingStaged;
+}
+
+// Merge a task branch into the base tree with serialized conflict handling.
+// On conflict the merge is aborted and { ok:false } returned so the caller can
+// re-queue the task. preHead lets the caller roll back after a failed test gate.
+function mergeBranch(baseTree, branch, taskId) {
+    const preHead = git(['rev-parse', 'HEAD'], baseTree).trim();
+    const merge = gitTry(['merge', '--no-ff', '-m', `ralph: merge ${taskId} (${branch})`, branch], baseTree);
+    if (!merge.ok) {
+        gitTry(['merge', '--abort'], baseTree);
+        return { ok: false, preHead };
+    }
+    return { ok: true, preHead };
+}
+
+function resetHard(baseTree, ref) {
+    gitTry(['reset', '--hard', ref], baseTree);
+}
+
+// True if `branch` carries at least one commit the base branch doesn't — i.e.
+// the agent actually produced work. Guards against checking off a task whose
+// agent exited 0 but changed nothing (which would silently drop the feature).
+function branchHasNewCommits(baseTree, baseBranch, branch) {
+    const r = gitTry(['rev-list', '--count', `${baseBranch}..${branch}`], baseTree);
+    return r.ok && parseInt(r.out.trim() || '0', 10) > 0;
+}
+
+function addWorktree(baseTree, wtPath, branch, baseBranch) {
+    fs.mkdirSync(path.dirname(wtPath), { recursive: true });
+    git(['worktree', 'add', '-b', branch, wtPath, baseBranch], baseTree);
+}
+
+// Make the .ralph/ worktree dir invisible to git via .git/info/exclude (a
+// local, uncommitted ignore). Without this, `git add -A` during check-off would
+// try to embed the worktrees, and a leftover .ralph/ would fail the clean-tree
+// precondition on the next run.
+function ensureRalphIgnored(baseTree) {
+    try {
+        const infoDir = path.join(baseTree, '.git', 'info');
+        fs.mkdirSync(infoDir, { recursive: true });
+        const excludePath = path.join(infoDir, 'exclude');
+        let content = '';
+        try { content = fs.readFileSync(excludePath, 'utf8'); } catch (_) { /* none yet */ }
+        if (!content.split('\n').some(l => l.trim() === '.ralph/')) {
+            const sep = content === '' || content.endsWith('\n') ? '' : '\n';
+            fs.appendFileSync(excludePath, `${sep}.ralph/\n`);
+        }
+    } catch (_) { /* non-fatal — worst case the precondition catches it */ }
+}
+
+// Remove every worktree/branch recorded for the active wave. Safe to call from
+// signal handlers — never throws, so a SIGINT mid-wave cannot leak worktrees.
+function cleanupWave() {
+    const wave = STATE.wave;
+    if (!wave) return;
+    for (const { wtPath, branch } of wave.worktrees) {
+        try { execFileSync('git', ['worktree', 'remove', '--force', wtPath], { cwd: wave.baseTree, timeout: 30_000 }); } catch (_) { /* gone */ }
+        try { execFileSync('git', ['branch', '-D', branch], { cwd: wave.baseTree, timeout: 30_000 }); } catch (_) { /* gone */ }
+    }
+    STATE.wave = null;
+}
+
+// ─── PRD Check-off & Progress (parallel mode — Ralph owns bookkeeping) ────────
+
+// Flip a task's checkbox to [x] in the PRD file. Matches the strict `**Tid:`
+// line first, then falls back to matching a generic checkbox by its title text.
+function checkOffTask(prdPath, task) {
+    let content;
+    try { content = fs.readFileSync(prdPath, 'utf8'); } catch (_) { return false; }
+    const lines = content.split('\n');
+    const idRe = new RegExp(`\\*\\*${task.id}:`);
+    const titleNeedle = task.title.replace(/…$/, '');
+
+    for (let i = 0; i < lines.length; i++) {
+        const isStrict = TASK_LINE_RE.test(lines[i]) && idRe.test(lines[i]);
+        const isFallback = CHECKBOX_LINE_RE.test(lines[i]) && titleNeedle && lines[i].includes(titleNeedle);
+        if ((isStrict || isFallback) && /\[ \]/.test(lines[i])) {
+            lines[i] = lines[i].replace('[ ]', '[x]');
+            fs.writeFileSync(prdPath, lines.join('\n'));
+            return true;
+        }
+    }
+    return false;
+}
+
+function appendProgress(baseTree, task) {
+    try {
+        const p = path.join(baseTree, 'PROGRESS.md');
+        fs.appendFileSync(p, `- ${task.id}: ${task.title} — completed (parallel wave)\n`);
+    } catch (_) { /* non-fatal */ }
+}
+
+// Record a completed task on the base branch: flip the PRD checkbox, append to
+// PROGRESS.md, and commit both so the task list stays the source of truth.
+function recordTaskDone(baseTree, prdPath, task) {
+    checkOffTask(prdPath, task);
+    appendProgress(baseTree, task);
+    commitAll(baseTree, `ralph: complete ${task.id} ${task.title}`);
+    task.done = true;
 }
 
 // ─── OS Notification ────────────────────────────────────────────────────────
@@ -424,11 +613,14 @@ function createUi(maxIters, prdPath) {
         const elapsed = formatElapsed(STATE.iterStartedAt);
         const session = formatElapsed(STATE.sessionStartedAt);
         const pauseTag = STATE.paused ? ' {yellow-fg}(PAUSED){/yellow-fg}' : '';
-        const child = STATE.child ? `pid ${STATE.child.pid}` : '—';
+        const childCount = STATE.children.size;
+        const child = childCount === 0 ? '—'
+            : childCount === 1 ? `pid ${[...STATE.children.values()][0].pid}`
+                : `${childCount} children`;
         const cost = formatCost(STATE.totalCost);
         const tokIn = formatTokens(STATE.totalInputTokens);
         const tokOut = formatTokens(STATE.totalOutputTokens);
-        const taskId = STATE.currentTaskId || '—';
+        const taskId = (STATE.parallel ? STATE.waveLabel : STATE.currentTaskId) || '—';
 
         const remaining = STATE.tasks.length > 0
             ? STATE.tasks.filter(t => !t.done).length
@@ -474,6 +666,46 @@ function createUi(maxIters, prdPath) {
         updateFilesTouched();
         updateTestResults(STATE.testResults);
         renderHeader('starting');
+    }
+
+    // Parallel mode: start a wave. Resets per-wave state and seeds the agent
+    // tree with one lane per task in the wave (visible via the 'a' panel).
+    function setWave(waveNum, wave) {
+        STATE.iter = waveNum;
+        STATE.iterStartedAt = Date.now();
+        STATE.filesTouchedMap.clear();
+        STATE.testResults = { passed: 0, failed: 0, skipped: 0 };
+        const count = wave.tasks.length;
+        STATE.waveLabel = `${wave.group || '—'} (${count} task${count !== 1 ? 's' : ''})`;
+        STATE.agentTree = { name: `ralph — wave ${waveNum}: ${STATE.waveLabel}`, extended: true, children: {} };
+        for (const t of wave.tasks) {
+            STATE.agentTree.children[t.id] = { name: ` {gray-fg}·{/gray-fg} ${t.id} ${t.title}`, extended: false, children: {} };
+        }
+        agentTreeWidget.setData(STATE.agentTree);
+        updateFilesTouched();
+        updateTestResults(STATE.testResults);
+        renderHeader('wave starting');
+    }
+
+    function setTaskLane(task, marker) {
+        const node = STATE.agentTree.children[task.id];
+        if (node) {
+            node.name = ` ${marker} ${task.id} ${task.title}`;
+            agentTreeWidget.setData(STATE.agentTree);
+            screen.render();
+        }
+    }
+
+    function markTaskRunning(task) {
+        setTaskLane(task, '{yellow-fg}▸{/yellow-fg}');
+    }
+
+    function markTaskResult(task, status) {
+        const marker = status === 'done' ? '{green-fg}✓{/green-fg}'
+            : status === 'requeue' ? '{yellow-fg}↺{/yellow-fg}'
+                : status === 'skipped' ? '{gray-fg}⊘{/gray-fg}'
+                    : '{red-fg}✗{/red-fg}';
+        setTaskLane(task, marker);
     }
 
     function setStatus(status) {
@@ -756,7 +988,7 @@ function createUi(maxIters, prdPath) {
     updateKeybindingsBar();
 
     return {
-        screen, setIter, setStatus, setActivity,
+        screen, setIter, setWave, markTaskRunning, markTaskResult, setStatus, setActivity,
         appendTaggedLine, updateTaskList, updateHistory,
         updateFilesTouched, updateGitSummary, updateTestResults,
         updateBudgetGauge, updateCostSparkline, updateTokenBar,
@@ -768,36 +1000,37 @@ function createUi(maxIters, prdPath) {
 
 // ─── Process Management ─────────────────────────────────────────────────────
 
-function killChild(signal) {
-    const child = STATE.child;
-    if (!child) return;
+function killProc(child, signal) {
     try { child.kill(signal); } catch (_) { /* already exited */ }
     const timer = setTimeout(() => {
-        if (STATE.child === child) {
-            try { child.kill('SIGKILL'); } catch (_) { /* gone */ }
-        }
+        try { child.kill('SIGKILL'); } catch (_) { /* gone */ }
     }, SIGKILL_GRACE_MS);
     timer.unref();
 }
 
+function killAllChildren(signal) {
+    for (const child of STATE.children.values()) killProc(child, signal);
+}
+
 function quit(code) {
-    if (STATE.child) killChild('SIGTERM');
+    killAllChildren('SIGTERM');
+    cleanupWave();
     STATE.ui?.destroy();
     process.exit(code);
 }
 
 function cancelCurrent(ui) {
-    if (!STATE.child) return;
+    if (STATE.children.size === 0) return;
     STATE.canceled = true;
     ui.appendTaggedLine('{yellow-fg}[canceled by user]{/yellow-fg}', 'system');
-    killChild('SIGTERM');
+    killAllChildren('SIGTERM');
 }
 
 function skipCurrent(ui) {
-    if (!STATE.child) return;
+    if (STATE.children.size === 0) return;
     STATE.skipped = true;
     ui.appendTaggedLine('{yellow-fg}[skipped by user]{/yellow-fg}', 'system');
-    killChild('SIGTERM');
+    killAllChildren('SIGTERM');
 }
 
 function togglePause(ui) {
@@ -820,20 +1053,29 @@ function sleep(ms) {
 
 // ─── Iteration Runner ───────────────────────────────────────────────────────
 
-function runIteration(promptBody, ui) {
-    STATE.canceled = false;
-    STATE.skipped = false;
+// Spawn one `claude -p` subprocess and parse its NDJSON stream. Used both by
+// the sequential loop (taskId null, cwd = repo root) and by parallel waves
+// (one call per task, each in its own git worktree cwd). Children are tracked
+// in STATE.children keyed by taskId so cancel/quit can reach every live agent.
+// Cost/token folding happens in the `close` handler; Node runs each callback to
+// completion so concurrent folds cannot interleave.
+function runAgent(promptBody, ui, opts = {}) {
+    const { taskId = null, cwd = process.cwd() } = opts;
+    const key = taskId ?? '__main__';
+    const tag = taskId ? `{gray-fg}[${taskId}]{/gray-fg} ` : '';
+    const emit = (text, category) => ui.appendTaggedLine(`${tag}${text}`, category);
+    const activity = text => ui.setActivity(taskId ? `[${taskId}] ${text}` : text);
 
     return new Promise(resolve => {
         const child = spawn('claude', [
             '-p', promptBody,
             '--output-format', 'stream-json',
             '--verbose',
-        ], { stdio: ['ignore', 'pipe', 'pipe'] });
+        ], { stdio: ['ignore', 'pipe', 'pipe'], cwd });
 
-        STATE.child = child;
+        STATE.children.set(key, child);
         ui.setStatus('running');
-        ui.setActivity('starting claude...');
+        activity('starting claude...');
 
         let resultEvent = null;
         let assistantText = '';
@@ -841,18 +1083,18 @@ function runIteration(promptBody, ui) {
 
         child.on('error', err => {
             spawnError = err;
-            ui.appendTaggedLine(`{red-fg}! claude error: ${err.message}{/red-fg}`, 'error');
+            emit(`{red-fg}! claude error: ${err.message}{/red-fg}`, 'error');
         });
 
         createInterface({ input: child.stdout }).on('line', jsonLine => {
             let event;
             try { event = JSON.parse(jsonLine); } catch (_) {
-                ui.appendTaggedLine(jsonLine, 'text');
+                emit(jsonLine, 'text');
                 return;
             }
 
             try { processStreamEvent(event); } catch (err) {
-                ui.appendTaggedLine(`{red-fg}! stream parse error: ${err.message}{/red-fg}`, 'error');
+                emit(`{red-fg}! stream parse error: ${err.message}{/red-fg}`, 'error');
             }
         });
 
@@ -860,7 +1102,7 @@ function runIteration(promptBody, ui) {
             switch (event.type) {
                 case 'system':
                     if (event.subtype === 'init') {
-                        ui.setActivity(`model: ${event.model || 'unknown'}`);
+                        activity(`model: ${event.model || 'unknown'}`);
                     }
                     break;
 
@@ -871,13 +1113,13 @@ function runIteration(promptBody, ui) {
                             if (assistantText.length < 50_000) assistantText += block.text;
                             for (const line of block.text.split('\n')) {
                                 const trimmed = line.trim();
-                                if (trimmed) ui.appendTaggedLine(trimmed, 'text');
+                                if (trimmed) emit(trimmed, 'text');
                             }
                         }
                         if (block.type === 'tool_use') {
                             const summary = summarizeToolUse(block);
-                            ui.setActivity(summary);
-                            ui.appendTaggedLine(`{cyan-fg}> ${summary}{/cyan-fg}`, 'tool');
+                            activity(summary);
+                            emit(`{cyan-fg}> ${summary}{/cyan-fg}`, 'tool');
 
                             const fileOp = classifyFileOp(block.name, block.input);
                             if (fileOp) {
@@ -931,7 +1173,7 @@ function runIteration(promptBody, ui) {
                             const errText = typeof block.content === 'string'
                                 ? block.content
                                 : JSON.stringify(block.content);
-                            ui.appendTaggedLine(`{red-fg}< ${errText.slice(0, 300)}{/red-fg}`, 'error');
+                            emit(`{red-fg}< ${errText.slice(0, 300)}{/red-fg}`, 'error');
                         }
                     }
                     break;
@@ -947,13 +1189,13 @@ function runIteration(promptBody, ui) {
         }
 
         createInterface({ input: child.stderr }).on('line', line => {
-            ui.appendTaggedLine(`{red-fg}! ${line}{/red-fg}`, 'error');
+            emit(`{red-fg}! ${line}{/red-fg}`, 'error');
         });
 
         child.on('close', code => {
             const canceled = STATE.canceled;
             const skipped = STATE.skipped;
-            STATE.child = null;
+            STATE.children.delete(key);
 
             const cost = resultEvent?.total_cost_usd ?? 0;
             const turns = resultEvent?.num_turns ?? 0;
@@ -971,27 +1213,58 @@ function runIteration(promptBody, ui) {
             STATE.iterTokens.push({ input: iterInput, output: iterOutput });
             STATE.iterDurationsMs.push(Date.now() - STATE.iterStartedAt);
 
-            const gitStat = fetchGitDiffStat();
+            const gitStat = fetchGitDiffStat(cwd);
             STATE.lastGitStat = gitStat;
             ui.updateGitSummary(gitStat);
             ui.updateCostSparkline();
             ui.updateTokenBar();
             ui.updateBudgetGauge();
-            ui.setActivity('iteration finished');
+            activity('finished');
 
-            resolve({ output: finalText, canceled, skipped, exitCode: code, spawnError, cost, turns });
+            resolve({
+                taskId,
+                output: finalText,
+                canceled, skipped,
+                exitCode: code,
+                spawnError, cost, turns,
+                inputTokens: iterInput,
+                outputTokens: iterOutput,
+            });
         });
     });
 }
 
+// Sequential single-agent iteration — unchanged behavior from the original loop.
+function runIteration(promptBody, ui) {
+    STATE.canceled = false;
+    STATE.skipped = false;
+    return runAgent(promptBody, ui, { cwd: process.cwd() });
+}
+
 // ─── Main Loop ──────────────────────────────────────────────────────────────
+
+async function waitWhilePaused(ui) {
+    while (STATE.paused) {
+        ui.setStatus('paused');
+        await sleep(PAUSE_POLL_MS);
+    }
+}
+
+function maybePauseForBudget(ui) {
+    if (STATE.budget && STATE.totalCost >= STATE.budget && !STATE.paused) {
+        STATE.paused = true;
+        STATE.pauseStartedAt = Date.now();
+        ui.appendTaggedLine(
+            `{red-fg}[budget exceeded: ${formatCost(STATE.totalCost)}/${formatCost(STATE.budget)} — paused]{/red-fg}`,
+            'system',
+        );
+        ui.updateBudgetGauge();
+    }
+}
 
 async function runLoop(promptBody, ui) {
     for (let i = 1; i <= STATE.maxIters; i++) {
-        while (STATE.paused) {
-            ui.setStatus('paused');
-            await sleep(PAUSE_POLL_MS);
-        }
+        await waitWhilePaused(ui);
 
         ui.setIter(i);
         const result = await runIteration(promptBody, ui);
@@ -1027,15 +1300,7 @@ async function runLoop(promptBody, ui) {
         pushHistory(i, outcome, result.cost);
         ui.updateHistory();
 
-        if (STATE.budget && STATE.totalCost >= STATE.budget && !STATE.paused) {
-            STATE.paused = true;
-            STATE.pauseStartedAt = Date.now();
-            ui.appendTaggedLine(
-                `{red-fg}[budget exceeded: ${formatCost(STATE.totalCost)}/${formatCost(STATE.budget)} — paused]{/red-fg}`,
-                'system',
-            );
-            ui.updateBudgetGauge();
-        }
+        maybePauseForBudget(ui);
 
         if (result.canceled || result.skipped) continue;
         ui.setStatus('iteration done');
@@ -1054,6 +1319,237 @@ function pushHistory(iter, outcome, cost) {
     });
 }
 
+// ─── Parallel Wave Scheduler ─────────────────────────────────────────────────
+
+// The literal prompt sent to each parallel agent. Unlike the sequential
+// PROMPT.md, the agent works on ONE named task, commits to its own branch, does
+// NOT push, and does NOT touch the PRD or PROGRESS.md — Ralph owns that
+// bookkeeping after a successful merge (see recordTaskDone).
+function buildParallelPrompt(task, prdPath) {
+    const desc = task.description ? ` — ${task.description}` : '';
+    return [
+        `You are one of several agents working in parallel, each on a separate task in its own git branch.`,
+        ``,
+        `Implement exactly this task and nothing else:`,
+        `  ${task.id}: ${task.title}${desc}`,
+        ``,
+        `Context: the full PRD is in @${prdPath} (read it for background only).`,
+        ``,
+        `Rules:`,
+        `- Touch ONLY the files this task owns. Do not modify files belonging to other tasks.`,
+        `- Commit your work to the current branch with a clear message. Do NOT push.`,
+        `- Do NOT edit the PRD/PROJECT file and do NOT edit PROGRESS.md — Ralph records progress after merging your branch.`,
+        `- Do not print a completion token.`,
+    ].join('\n');
+}
+
+// A genuine process failure (as opposed to a deliberate user cancel/skip).
+function agentErrored(res) {
+    return Boolean(res.spawnError) || res.exitCode !== 0;
+}
+
+// Run a single task directly on the base branch (no worktree/merge): used for
+// single-task waves and for re-queued tasks that lost their parallel merge.
+// When tests exist they gate the result and a failure is rolled back.
+// Returns { ok, aborted, res }: aborted means the user canceled/skipped — the
+// caller should leave the task undone and move on rather than retry.
+async function runSoloTask(task, prdPath, baseTree, hasTests, ui) {
+    STATE.canceled = false;
+    STATE.skipped = false;
+    ui.markTaskRunning(task);
+
+    const preHead = git(['rev-parse', 'HEAD'], baseTree).trim();
+    const res = await runAgent(buildParallelPrompt(task, prdPath), ui, { taskId: task.id, cwd: baseTree });
+
+    if (res.canceled || res.skipped) {
+        resetHard(baseTree, preHead);
+        ui.markTaskResult(task, 'skipped');
+        return { ok: false, aborted: true, res };
+    }
+
+    if (agentErrored(res)) {
+        resetHard(baseTree, preHead);
+        ui.markTaskResult(task, 'failed');
+        return { ok: false, res };
+    }
+
+    commitAll(baseTree, `ralph: ${task.id} ${task.title}`);
+
+    if (git(['rev-parse', 'HEAD'], baseTree).trim() === preHead) {
+        ui.appendTaggedLine(`{red-fg}[${task.id}] agent produced no changes{/red-fg}`, 'error');
+        ui.markTaskResult(task, 'failed');
+        return { ok: false, res };
+    }
+
+    if (hasTests) {
+        ui.setActivity(`[${task.id}] running tests...`);
+        const t = runTests(baseTree);
+        const parsed = parseTestOutput(t.out);
+        if (parsed) { STATE.testResults = parsed; ui.updateTestResults(parsed); }
+        if (!t.ok) {
+            resetHard(baseTree, preHead);
+            ui.appendTaggedLine(`{yellow-fg}[${task.id}] tests failed — rolled back{/yellow-fg}`, 'system');
+            ui.markTaskResult(task, 'failed');
+            return { ok: false, res };
+        }
+    }
+
+    recordTaskDone(baseTree, prdPath, task);
+    ui.markTaskResult(task, 'done');
+    return { ok: true, res };
+}
+
+// Run a solo task with a single retry on genuine failure (not on user abort).
+async function attemptSolo(task, prdPath, baseTree, hasTests, ui) {
+    const first = await runSoloTask(task, prdPath, baseTree, hasTests, ui);
+    if (first.ok || first.aborted) return first;
+    return runSoloTask(task, prdPath, baseTree, hasTests, ui);
+}
+
+// Run every task in a wave concurrently in isolated worktrees, then merge each
+// branch back one at a time with a test gate. Returns the tasks that must be
+// re-queued (merge conflict, failed tests, agent error, or worktree failure).
+async function runMultiTaskWave(wave, prdPath, baseTree, baseBranch, hasTests, ui) {
+    STATE.canceled = false;
+    STATE.skipped = false;
+    STATE.wave = { baseTree, worktrees: [] };
+
+    const entries = [];
+    for (const task of wave.tasks) {
+        const branch = buildBranchName(task.id, task.title);
+        const wtPath = path.join(baseTree, '.ralph', 'worktrees', task.id);
+        gitTry(['worktree', 'remove', '--force', wtPath], baseTree);
+        gitTry(['branch', '-D', branch], baseTree);
+        try {
+            addWorktree(baseTree, wtPath, branch, baseBranch);
+        } catch (err) {
+            ui.appendTaggedLine(`{red-fg}[${task.id}] worktree add failed: ${err.message}{/red-fg}`, 'error');
+            continue;
+        }
+        STATE.wave.worktrees.push({ taskId: task.id, wtPath, branch });
+        entries.push({ task, branch, wtPath });
+        ui.markTaskRunning(task);
+    }
+
+    const results = await Promise.all(entries.map(e =>
+        runAgent(buildParallelPrompt(e.task, prdPath), ui, { taskId: e.task.id, cwd: e.wtPath })
+            .then(res => ({ ...e, res })),
+    ));
+
+    const requeue = wave.tasks.filter(t => !entries.some(e => e.task.id === t.id));
+
+    for (const { task, branch, wtPath, res } of results) {
+        if (res.canceled || res.skipped) {
+            ui.markTaskResult(task, 'skipped');
+            continue;
+        }
+        if (agentErrored(res)) {
+            ui.markTaskResult(task, 'requeue');
+            requeue.push(task);
+            continue;
+        }
+
+        commitAll(wtPath, `ralph: ${task.id} ${task.title}`);
+
+        if (!branchHasNewCommits(baseTree, baseBranch, branch)) {
+            ui.appendTaggedLine(`{yellow-fg}[${task.id}] agent produced no changes — retry solo{/yellow-fg}`, 'system');
+            ui.markTaskResult(task, 'requeue');
+            requeue.push(task);
+            continue;
+        }
+
+        const merge = mergeBranch(baseTree, branch, task.id);
+        if (!merge.ok) {
+            ui.appendTaggedLine(`{yellow-fg}[${task.id}] merge conflict — rolling back, retry solo{/yellow-fg}`, 'system');
+            ui.markTaskResult(task, 'requeue');
+            requeue.push(task);
+            continue;
+        }
+
+        if (hasTests) {
+            ui.setActivity(`[${task.id}] running tests after merge...`);
+            const t = runTests(baseTree);
+            const parsed = parseTestOutput(t.out);
+            if (parsed) { STATE.testResults = parsed; ui.updateTestResults(parsed); }
+            if (!t.ok) {
+                resetHard(baseTree, merge.preHead);
+                ui.appendTaggedLine(`{yellow-fg}[${task.id}] tests failed after merge — rolled back, retry solo{/yellow-fg}`, 'system');
+                ui.markTaskResult(task, 'requeue');
+                requeue.push(task);
+                continue;
+            }
+        }
+
+        recordTaskDone(baseTree, prdPath, task);
+        ui.markTaskResult(task, 'done');
+    }
+
+    cleanupWave();
+    return requeue;
+}
+
+async function runWaves(prdPath, ui) {
+    const baseTree = process.cwd();
+
+    if (!isGitRepo(baseTree)) return { reason: 'not-git' };
+    ensureRalphIgnored(baseTree);
+    gitTry(['worktree', 'prune'], baseTree);
+    if (!isWorkingTreeClean(baseTree)) return { reason: 'dirty-tree' };
+
+    const baseBranch = currentBranch(baseTree);
+    const hasTests = detectTestCommand(baseTree);
+
+    const tasks = STATE.tasks;
+    const waves = groupTasksIntoWaves(tasks, STATE.maxParallel);
+    if (waves.length === 0) return { reason: 'complete', iter: 0 };
+
+    ui.appendTaggedLine(
+        `{cyan-fg}[parallel mode: ${waves.length} wave(s) on ${baseBranch}, test gate ${hasTests ? 'on' : 'off'}]{/cyan-fg}`,
+        'system',
+    );
+
+    let waveNum = 0;
+
+    for (const wave of waves) {
+        await waitWhilePaused(ui);
+        waveNum += 1;
+        ui.setWave(waveNum, wave);
+
+        let requeue = [];
+        let waveCost = 0;
+
+        if (wave.tasks.length === 1) {
+            const r = await attemptSolo(wave.tasks[0], prdPath, baseTree, hasTests, ui);
+            waveCost += r.res?.cost ?? 0;
+            // aborted (user cancel/skip) → leave the task undone and move on.
+            if (!r.ok && !r.aborted) {
+                pushHistory(waveNum, 'error', waveCost);
+                ui.updateHistory();
+                return { reason: 'task-failed', taskId: wave.tasks[0].id, iter: waveNum };
+            }
+        } else {
+            requeue = await runMultiTaskWave(wave, prdPath, baseTree, baseBranch, hasTests, ui);
+            for (const task of requeue) {
+                const r = await attemptSolo(task, prdPath, baseTree, hasTests, ui);
+                waveCost += r.res?.cost ?? 0;
+                if (!r.ok && !r.aborted) {
+                    pushHistory(waveNum, 'error', waveCost);
+                    ui.updateHistory();
+                    return { reason: 'task-failed', taskId: task.id, iter: waveNum };
+                }
+            }
+        }
+
+        pushHistory(waveNum, 'done', waveCost);
+        ui.updateTaskList(tasks);
+        ui.updateHistory();
+        maybePauseForBudget(ui);
+    }
+
+    const remaining = tasks.filter(t => !t.done);
+    return { reason: remaining.length === 0 ? 'complete' : 'max-iters', iter: waveNum };
+}
+
 // ─── Finish ─────────────────────────────────────────────────────────────────
 
 function finish(result, ui) {
@@ -1070,8 +1566,25 @@ function finish(result, ui) {
             process.stdout.write(`${message}\n`);
             break;
         case 'max-iters':
-            message = `Reached max iterations (${STATE.maxIters}).${costSummary}`;
+            message = STATE.parallel
+                ? `Some tasks remain incomplete after all waves.${costSummary}`
+                : `Reached max iterations (${STATE.maxIters}).${costSummary}`;
             process.stdout.write(`${message}\n`);
+            break;
+        case 'task-failed':
+            message = `Task ${result.taskId} failed after retry — stopping.${costSummary}`;
+            process.stderr.write(`${message}\n`);
+            exitCode = 2;
+            break;
+        case 'not-git':
+            message = 'Parallel mode requires a git repository. Run without --parallel for sequential mode.';
+            process.stderr.write(`${message}\n`);
+            exitCode = 2;
+            break;
+        case 'dirty-tree':
+            message = 'Parallel mode requires a clean working tree. Commit or stash your changes first.';
+            process.stderr.write(`${message}\n`);
+            exitCode = 2;
             break;
         case 'non-zero-exit':
             message = `claude exited with code ${result.exitCode} on iter ${result.iter}.${costSummary}`;
@@ -1102,6 +1615,7 @@ function registerSignalHandlers() {
     process.on('SIGINT', () => quit(130));
     process.on('SIGTERM', () => quit(143));
     process.on('uncaughtException', err => {
+        try { cleanupWave(); } catch (_) { /* best effort */ }
         STATE.ui?.destroy();
         process.stderr.write(`uncaught exception: ${err.stack ?? err.message}\n`);
         process.exit(2);
@@ -1137,6 +1651,8 @@ function main() {
     STATE.prdPath = args.prdPath;
     STATE.maxIters = args.maxIters;
     STATE.budget = args.budget ?? null;
+    STATE.parallel = Boolean(args.parallel);
+    STATE.maxParallel = args.maxParallel ?? DEFAULT_WAVE_CAP;
     STATE.sessionStartedAt = Date.now();
     STATE.tasks = parsePrdTasks(args.prdPath);
 
@@ -1168,7 +1684,8 @@ function main() {
 
     registerSignalHandlers();
 
-    runLoop(promptBody, ui)
+    const loop = STATE.parallel ? runWaves(args.prdPath, ui) : runLoop(promptBody, ui);
+    loop
         .finally(() => {
             clearInterval(headerTick);
             prdWatcher.close();
@@ -1176,4 +1693,10 @@ function main() {
         .then(result => finish(result, ui));
 }
 
-main();
+// Run main only when executed directly (not when imported by a test). Importing
+// the module gives tests access to runWaves/STATE without launching the TUI.
+const invokedDirectly = process.argv[1]
+    && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (invokedDirectly) main();
+
+export { runWaves, STATE };
