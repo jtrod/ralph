@@ -13,9 +13,11 @@ npm test                      # run the full test suite (node --test)
 node --test test/ralph.test.js   # run one test file
 npm install                   # also runs bin/setup.js postinstall (scaffolds PROMPT.md + /prd)
 
-ralph <prd-file> [iterations=10] [--budget <usd>]   # start the sequential loop (needs a real TTY)
-ralph <prd-file> --parallel [--max-parallel <n>]    # run each ### Wn work group as a concurrent wave
-ralph init                    # scaffold PROMPT.md and .claude/commands/prd.md, then exit
+ralph <prd-file> [iterations=10] [--budget <usd>]   # start the loop, parallel by default (needs a real TTY)
+ralph <prd-file> --sequential                       # force the one-task-per-iteration loop (--no-parallel alias)
+ralph <prd-file> [--max-parallel <n>]               # cap concurrent agents per ### Wn wave (default 6)
+ralph init                    # scaffold PROMPT.md and .claude/commands/prd.md (skips existing), then exit
+ralph update                  # overwrite PROMPT.md + /prd command with this version's templates (alias: init --force)
 ```
 
 There is no build step, linter, or transpiler — this is plain Node ESM (`"type": "module"`, Node >= 18). Tests use the built-in `node:test` runner. `test/ralph.test.js` covers the pure functions in `lib/ralph-utils.js` plus CLI arg handling; `test/parallel.test.js` drives the `runWaves` scheduler end-to-end against a fake `claude` on `PATH` in throwaway git repos (the module exports `runWaves`/`STATE` and only runs `main()` when invoked directly, so it can be imported by tests). The blessed TUI itself is not unit-tested.
@@ -33,7 +35,9 @@ Both the sequential loop and the parallel scheduler spawn agents through one sha
 
 **Loop termination (sequential)** is decided in `runLoop` by inspecting each iteration's result, in priority order: spawn error → user-canceled → user-skipped → non-zero exit → `<promise>COMPLETE</promise>` token in output (regex `COMPLETE_TOKEN`) → budget exceeded (pauses, does not exit) → max iterations.
 
-**Parallel mode** (`--parallel`, `runWaves`): `groupTasksIntoWaves` (in `lib/ralph-utils.js`) partitions not-yet-done tasks into waves — same `### Wn` group = one wave, groups run in order, oversized groups chunked to the `--max-parallel` cap. Each multi-task wave creates one git worktree+branch per task under `.ralph/worktrees/<taskId>` (ignored via `.git/info/exclude`), runs all agents with `Promise.all`, then merges each branch back to the base branch **one at a time** (`mergeBranch`), running `npm test` after each merge when a test script exists. A merge conflict or test failure rolls the task back (`git merge --abort` / `reset --hard`) and re-queues it to run solo. **Ralph owns all PRD check-offs and `PROGRESS.md` writes** (`recordTaskDone`) — the parallel agent prompt (`buildParallelPrompt`) explicitly forbids agents from touching those files or pushing. Termination: all tasks checked off → `complete`; a task that fails even after a solo retry → `task-failed`; non-git or dirty tree → `not-git`/`dirty-tree`. Worktrees are cleaned up after every wave and on quit/crash (`cleanupWave`).
+**Mode selection** is decided in `main()`: parallel is the **default**, but `parallelFallbackReason` (in `lib/ralph-utils.js`) downgrades to the sequential loop — emitting a yellow `[notice: … — running sequentially]` line — when the cwd is not a git repo, the working tree is dirty, or the PRD yields zero parseable tasks (which would otherwise make `runWaves` no-op as instantly "complete"). `--sequential`/`--no-parallel` forces sequential; `--parallel` is an accepted no-op alias. `maxIters` only bounds the sequential loop — `runWaves` runs every wave once.
+
+**Parallel mode** (`runWaves`, the default): `groupTasksIntoWaves` (in `lib/ralph-utils.js`) partitions not-yet-done tasks into waves — same `### Wn` group = one wave, groups run in order, oversized groups chunked to the `--max-parallel` cap. Each multi-task wave creates one git worktree+branch per task under `.ralph/worktrees/<taskId>` (ignored via `.git/info/exclude`), runs all agents with `Promise.all`, then merges each branch back to the base branch **one at a time** (`mergeBranch`), running `npm test` after each merge when a test script exists. A merge conflict or test failure rolls the task back (`git merge --abort` / `reset --hard`) and re-queues it to run solo. **Ralph owns all PRD check-offs and `PROGRESS.md` writes** (`recordTaskDone`) — the parallel agent prompt (`buildParallelPrompt`) explicitly forbids agents from touching those files or pushing. Termination: all tasks checked off → `complete`; a task that fails even after a solo retry → `task-failed`; non-git or dirty tree → `not-git`/`dirty-tree`. Worktrees are cleaned up after every wave and on quit/crash (`cleanupWave`).
 
 ### Two things drive the agent's behavior
 
@@ -43,7 +47,9 @@ Both the sequential loop and the parallel scheduler spawn agents through one sha
 
 ### Scaffolding
 
-`bin/setup.js` (npm `postinstall`) and `ralph init` both copy `templates/PROMPT.md` → cwd and `templates/prd.md` → `.claude/commands/prd.md` (the `/prd` slash command). `setup.js` walks up out of `node_modules` to find the consuming project root and fails silently so it never breaks `npm install`; `runInit` is the explicit, verbose equivalent.
+`bin/setup.js` (npm `postinstall`) and `ralph init` both copy `templates/PROMPT.md` → cwd and `templates/prd.md` → `.claude/commands/prd.md` (the `/prd` slash command). Both **skip files that already exist**, so neither a re-install nor a re-run ever clobbers user edits — which also means **upgrading the package does not refresh the scaffolded assets**. `setup.js` walks up out of `node_modules` to find the consuming project root and fails silently so it never breaks `npm install`; `runInit(force)` is the explicit, verbose equivalent.
+
+`ralph update` (and `ralph init --force`) call `runInit(true)`, which **overwrites** `PROMPT.md` and the `/prd` command with the installed version's templates — this is the supported way to pull template changes (e.g. an updated parallel-wave PRD format) into an existing project after upgrading. The `update`/`--force` dispatch lives in `main()`; `copyTemplate(name, dest, force)` prints `created` / `updated` / `skipped (exists)` accordingly. The postinstall hook deliberately never forces, to avoid silently discarding a customized `PROMPT.md` on every `npm install`.
 
 **`ralph.sh`** is a minimal headless fallback (no TUI, no cost tracking) for CI / non-TTY environments — `bin/ralph.js` hard-exits if `stdout` is not a TTY.
 

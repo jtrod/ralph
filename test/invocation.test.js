@@ -19,7 +19,6 @@ describe('symlinked invocation runs main()', () => {
     let prdPath;
 
     before(() => {
-    before(() => {
         tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-inv-'));
         linkPath = path.join(tmpDir, 'link-ralph.js');
         fs.symlinkSync(RALPH_BIN, linkPath, 'file');

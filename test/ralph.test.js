@@ -1,4 +1,4 @@
-import { describe, it } from 'node:test';
+import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -11,7 +11,9 @@ import {
     computeEta, computeBurnRate, summarizeToolUse,
     parsePrdTasksFromContent,
     groupTasksIntoWaves, buildBranchName,
+    parallelFallbackReason, shouldRunParallel,
 } from '../lib/ralph-utils.js';
+import { parseArgs } from '../bin/ralph.js';
 
 describe('formatElapsed', () => {
     it('returns 00:00 for falsy input', () => {
@@ -453,6 +455,81 @@ describe('groupTasksIntoWaves', () => {
     });
 });
 
+describe('parallelFallbackReason / shouldRunParallel', () => {
+    const ok = { requested: true, isGit: true, clean: true, taskCount: 3 };
+
+    it('returns null (runs parallel) when all preconditions hold', () => {
+        assert.equal(parallelFallbackReason(ok), null);
+        assert.equal(shouldRunParallel(ok), true);
+    });
+
+    it('falls back when parallel was not requested', () => {
+        const r = parallelFallbackReason({ ...ok, requested: false });
+        assert.match(r, /sequential requested/);
+        assert.equal(shouldRunParallel({ ...ok, requested: false }), false);
+    });
+
+    it('falls back when not a git repo', () => {
+        assert.match(parallelFallbackReason({ ...ok, isGit: false }), /not a git repo/);
+        assert.equal(shouldRunParallel({ ...ok, isGit: false }), false);
+    });
+
+    it('falls back when the working tree is dirty', () => {
+        assert.match(parallelFallbackReason({ ...ok, clean: false }), /dirty/);
+        assert.equal(shouldRunParallel({ ...ok, clean: false }), false);
+    });
+
+    it('falls back when there are no parseable tasks (the dangerous no-op case)', () => {
+        assert.match(parallelFallbackReason({ ...ok, taskCount: 0 }), /no parseable/);
+        assert.equal(shouldRunParallel({ ...ok, taskCount: 0 }), false);
+    });
+
+    it('checks git before tree-cleanliness when both fail', () => {
+        // not-git takes priority so the message points at the root cause.
+        assert.match(parallelFallbackReason({ ...ok, isGit: false, clean: false }), /not a git repo/);
+    });
+});
+
+describe('parseArgs (mode defaults)', () => {
+    let fixture, prevCwd;
+
+    before(() => {
+        fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-args-'));
+        fs.writeFileSync(path.join(fixture, 'PROMPT.md'), 'Work on @PROJECT.md\n');
+        fs.writeFileSync(path.join(fixture, 'PRD.md'), '# PRD\n');
+        prevCwd = process.cwd();
+        process.chdir(fixture);
+    });
+
+    after(() => {
+        process.chdir(prevCwd);
+        fs.rmSync(fixture, { recursive: true, force: true });
+    });
+
+    const parse = (...flags) => parseArgs(['node', 'ralph', 'PRD.md', ...flags]);
+
+    it('defaults to parallel mode', () => {
+        assert.equal(parse().parallel, true);
+    });
+
+    it('--sequential forces sequential', () => {
+        assert.equal(parse('--sequential').parallel, false);
+    });
+
+    it('--no-parallel is an alias for --sequential', () => {
+        assert.equal(parse('--no-parallel').parallel, false);
+    });
+
+    it('--parallel is an accepted no-op (stays parallel)', () => {
+        assert.equal(parse('--parallel').parallel, true);
+    });
+
+    it('--max-parallel does not override --sequential, regardless of order', () => {
+        assert.equal(parse('--sequential', '--max-parallel', '4').parallel, false);
+        assert.equal(parse('--max-parallel', '4', '--sequential').parallel, false);
+    });
+});
+
 describe('buildBranchName', () => {
     it('slugifies the title', () => {
         assert.equal(buildBranchName('T1', 'Create the User model'), 'ralph/T1-create-the-user-model');
@@ -568,15 +645,22 @@ describe('ralph CLI', () => {
         assert.match(stderr, /requires a TTY/);
     });
 
-    it('documents --parallel in help', () => {
+    it('documents --sequential and --max-parallel in help', () => {
         const { code, stdout } = run('--help');
         assert.equal(code, 0);
-        assert.match(stdout, /--parallel/);
+        assert.match(stdout, /--sequential/);
         assert.match(stdout, /--max-parallel/);
+        assert.match(stdout, /default/i);
     });
 
-    it('accepts --parallel with valid args (still fails on TTY)', () => {
+    it('accepts --parallel as a no-op alias (still fails on TTY)', () => {
         const { code, stderr } = run('PROMPT.md', '--parallel');
+        assert.equal(code, 2);
+        assert.match(stderr, /requires a TTY/);
+    });
+
+    it('accepts --sequential with valid args (still fails on TTY)', () => {
+        const { code, stderr } = run('PROMPT.md', '--sequential');
         assert.equal(code, 2);
         assert.match(stderr, /requires a TTY/);
     });
@@ -589,9 +673,9 @@ describe('ralph CLI', () => {
 });
 
 describe('ralph init', () => {
-    function runInitIn(cwd) {
+    function runInitIn(cwd, ...args) {
         try {
-            const stdout = execFileSync('node', [BIN, 'init'], {
+            const stdout = execFileSync('node', [BIN, ...args], {
                 encoding: 'utf8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'], cwd,
             });
             return { code: 0, stdout };
@@ -605,16 +689,45 @@ describe('ralph init', () => {
         const prompt = path.join(dir, 'PROMPT.md');
         const prd = path.join(dir, '.claude', 'commands', 'prd.md');
 
-        const first = runInitIn(dir);
+        const first = runInitIn(dir, 'init');
         assert.equal(first.code, 0);
         assert.ok(fs.existsSync(prompt), 'PROMPT.md created');
         assert.ok(fs.existsSync(prd), '.claude/commands/prd.md created');
         assert.match(fs.readFileSync(prd, 'utf8'), /^## Tasks$/m);
 
         fs.writeFileSync(prompt, 'CUSTOM');
-        const second = runInitIn(dir);
+        const second = runInitIn(dir, 'init');
         assert.equal(second.code, 0);
         assert.match(second.stdout, /skipped \(exists\)/);
         assert.equal(fs.readFileSync(prompt, 'utf8'), 'CUSTOM', 'existing file preserved');
+    });
+
+    it('update overwrites existing PROMPT.md and the /prd command', () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-update-'));
+        const prompt = path.join(dir, 'PROMPT.md');
+        const prd = path.join(dir, '.claude', 'commands', 'prd.md');
+
+        assert.equal(runInitIn(dir, 'init').code, 0);
+        fs.writeFileSync(prompt, 'STALE');
+        fs.writeFileSync(prd, 'STALE');
+
+        const upd = runInitIn(dir, 'update');
+        assert.equal(upd.code, 0);
+        assert.match(upd.stdout, /updated:/);
+        assert.notEqual(fs.readFileSync(prompt, 'utf8'), 'STALE', 'PROMPT.md refreshed');
+        assert.match(fs.readFileSync(prd, 'utf8'), /^## Tasks$/m, '/prd command refreshed');
+    });
+
+    it('init --force also overwrites existing assets', () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-force-'));
+        const prompt = path.join(dir, 'PROMPT.md');
+
+        assert.equal(runInitIn(dir, 'init').code, 0);
+        fs.writeFileSync(prompt, 'STALE');
+
+        const forced = runInitIn(dir, 'init', '--force');
+        assert.equal(forced.code, 0);
+        assert.match(forced.stdout, /updated:/);
+        assert.notEqual(fs.readFileSync(prompt, 'utf8'), 'STALE', 'PROMPT.md refreshed');
     });
 });
