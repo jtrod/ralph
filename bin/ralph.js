@@ -260,7 +260,12 @@ const GIT_TIMEOUT_MS = 120_000;
 const TEST_TIMEOUT_MS = 600_000;
 
 function git(args, cwd = process.cwd()) {
-    return execFileSync('git', args, { encoding: 'utf8', cwd, timeout: GIT_TIMEOUT_MS });
+    // Capture stderr (don't inherit it). execFileSync forwards the child's
+    // stderr to our terminal by default, which leaks expected first-run
+    // cleanup failures (e.g. `worktree remove` on a path that doesn't exist
+    // yet) and git's `Preparing worktree …` notice past the TUI. stdout is
+    // still returned; on failure, stderr remains available on err.stderr.
+    return execFileSync('git', args, { encoding: 'utf8', cwd, timeout: GIT_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'pipe'] });
 }
 
 // Run git without throwing; returns { ok, out }. ok reflects a zero exit code.
@@ -368,8 +373,8 @@ function cleanupWave() {
     const wave = STATE.wave;
     if (!wave) return;
     for (const { wtPath, branch } of wave.worktrees) {
-        try { execFileSync('git', ['worktree', 'remove', '--force', wtPath], { cwd: wave.baseTree, timeout: 30_000 }); } catch (_) { /* gone */ }
-        try { execFileSync('git', ['branch', '-D', branch], { cwd: wave.baseTree, timeout: 30_000 }); } catch (_) { /* gone */ }
+        try { execFileSync('git', ['worktree', 'remove', '--force', wtPath], { cwd: wave.baseTree, timeout: 30_000, stdio: ['ignore', 'ignore', 'ignore'] }); } catch (_) { /* gone */ }
+        try { execFileSync('git', ['branch', '-D', branch], { cwd: wave.baseTree, timeout: 30_000, stdio: ['ignore', 'ignore', 'ignore'] }); } catch (_) { /* gone */ }
     }
     STATE.wave = null;
 }
