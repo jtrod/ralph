@@ -1695,8 +1695,17 @@ function main() {
 
 // Run main only when executed directly (not when imported by a test). Importing
 // the module gives tests access to runWaves/STATE without launching the TUI.
-const invokedDirectly = process.argv[1]
-    && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+// realpathSync both sides so symlinked launches (npm bin, npx, npm link) still
+// match: argv[1] keeps the symlink path while import.meta.url is the realpath.
+const invokedDirectly = (() => {
+    if (!process.argv[1]) return false;
+    try {
+        return fs.realpathSync(process.argv[1])
+            === fs.realpathSync(fileURLToPath(import.meta.url));
+    } catch (_) {
+        return false;
+    }
+})();
 if (invokedDirectly) main();
 
 export { runWaves, STATE };
