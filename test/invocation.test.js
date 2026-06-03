@@ -19,9 +19,10 @@ describe('symlinked invocation runs main()', () => {
     let prdPath;
 
     before(() => {
+    before(() => {
         tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-inv-'));
         linkPath = path.join(tmpDir, 'link-ralph.js');
-        fs.symlinkSync(RALPH_BIN, linkPath);
+        fs.symlinkSync(RALPH_BIN, linkPath, 'file');
         prdPath = path.join(tmpDir, 'PRD.md');
         fs.writeFileSync(prdPath, '# PRD\n');
         // parseArgs requires PROMPT.md in cwd; create it so arg validation passes
