@@ -12,6 +12,7 @@ import {
     parsePrdTasksFromContent,
     groupTasksIntoWaves, buildBranchName,
     parallelFallbackReason, shouldRunParallel,
+    escapeTags,
 } from '../lib/ralph-utils.js';
 import { parseArgs } from '../bin/ralph.js';
 
@@ -308,6 +309,55 @@ describe('parsePrdTasksFromContent', () => {
         const tasks = parsePrdTasksFromContent(content);
         assert.equal(tasks.length, 1);
         assert.equal(tasks[0].id, 'T1');
+    });
+
+    it('tolerates an annotation between the task id and the colon', () => {
+        const content = `## Tasks
+
+### W0: Foundation
+
+- [ ] **T1 (∥): Translations** — Add keys
+- [ ] **T2 (∥ lane): Modelo 303** — Build lane
+- [ ] **T3 (⛔ blocked): Modelo 347** — Needs upstream
+`;
+        const tasks = parsePrdTasksFromContent(content);
+        assert.equal(tasks.length, 3);
+        assert.deepEqual(tasks.map(t => t.id), ['T1', 'T2', 'T3']);
+        assert.equal(tasks[0].title, 'Translations');
+        assert.equal(tasks[0].description, 'Add keys');
+        assert.equal(tasks[1].title, 'Modelo 303');
+        assert.equal(tasks[2].title, 'Modelo 347');
+    });
+
+    it('parses work groups with a lowercase suffix (W3b)', () => {
+        const content = `## Tasks
+
+### W3b: Blocked lanes
+
+- [ ] **T9: Something** — body
+`;
+        const tasks = parsePrdTasksFromContent(content);
+        assert.equal(tasks.length, 1);
+        assert.equal(tasks[0].group, 'W3b');
+    });
+});
+
+describe('escapeTags', () => {
+    it('neutralizes blessed tag braces so they render literally', () => {
+        assert.equal(escapeTags('lang/{es,ca,en}/x.php'), 'lang/{open}es,ca,en{close}/x.php');
+    });
+
+    it('leaves brace-free text untouched', () => {
+        assert.equal(escapeTags('Edit: app/Models/User.php'), 'Edit: app/Models/User.php');
+    });
+
+    it('coerces nullish input to an empty string', () => {
+        assert.equal(escapeTags(null), '');
+        assert.equal(escapeTags(undefined), '');
+    });
+
+    it('escapes every brace in mixed content', () => {
+        assert.equal(escapeTags('a{b}c{d}'), 'a{open}b{close}c{open}d{close}');
     });
 });
 

@@ -16,6 +16,7 @@ import {
     groupTasksIntoWaves, buildBranchName, DEFAULT_WAVE_CAP,
     parallelFallbackReason,
     TASK_LINE_RE, CHECKBOX_LINE_RE,
+    escapeTags,
 } from '../lib/ralph-utils.js';
 
 const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -713,7 +714,7 @@ function createUi(maxIters, prdPath) {
     function setTaskLane(task, marker) {
         const node = STATE.agentTree.children[task.id];
         if (node) {
-            node.name = ` ${marker} ${task.id} ${task.title}`;
+            node.name = ` ${marker} ${escapeTags(task.id)} ${escapeTags(task.title)}`;
             agentTreeWidget.setData(STATE.agentTree);
             screen.render();
         }
@@ -737,8 +738,8 @@ function createUi(maxIters, prdPath) {
 
     function setActivity(text) {
         const taskDesc = currentTaskDescription();
-        const suffix = taskDesc ? `  {gray-fg}| ${taskDesc}{/gray-fg}` : '';
-        activity.setContent(` {cyan-fg}>{/cyan-fg} ${text}${suffix}`);
+        const suffix = taskDesc ? `  {gray-fg}| ${escapeTags(taskDesc)}{/gray-fg}` : '';
+        activity.setContent(` {cyan-fg}>{/cyan-fg} ${escapeTags(text)}${suffix}`);
         screen.render();
     }
 
@@ -1085,7 +1086,7 @@ function sleep(ms) {
 function runAgent(promptBody, ui, opts = {}) {
     const { taskId = null, cwd = process.cwd() } = opts;
     const key = taskId ?? '__main__';
-    const tag = taskId ? `{gray-fg}[${taskId}]{/gray-fg} ` : '';
+    const tag = taskId ? `{gray-fg}[${escapeTags(taskId)}]{/gray-fg} ` : '';
     const emit = (text, category) => ui.appendTaggedLine(`${tag}${text}`, category);
     const activity = text => ui.setActivity(taskId ? `[${taskId}] ${text}` : text);
 
@@ -1106,18 +1107,18 @@ function runAgent(promptBody, ui, opts = {}) {
 
         child.on('error', err => {
             spawnError = err;
-            emit(`{red-fg}! claude error: ${err.message}{/red-fg}`, 'error');
+            emit(`{red-fg}! claude error: ${escapeTags(err.message)}{/red-fg}`, 'error');
         });
 
         createInterface({ input: child.stdout }).on('line', jsonLine => {
             let event;
             try { event = JSON.parse(jsonLine); } catch (_) {
-                emit(jsonLine, 'text');
+                emit(escapeTags(jsonLine), 'text');
                 return;
             }
 
             try { processStreamEvent(event); } catch (err) {
-                emit(`{red-fg}! stream parse error: ${err.message}{/red-fg}`, 'error');
+                emit(`{red-fg}! stream parse error: ${escapeTags(err.message)}{/red-fg}`, 'error');
             }
         });
 
@@ -1136,13 +1137,13 @@ function runAgent(promptBody, ui, opts = {}) {
                             if (assistantText.length < 50_000) assistantText += block.text;
                             for (const line of block.text.split('\n')) {
                                 const trimmed = line.trim();
-                                if (trimmed) emit(trimmed, 'text');
+                                if (trimmed) emit(escapeTags(trimmed), 'text');
                             }
                         }
                         if (block.type === 'tool_use') {
                             const summary = summarizeToolUse(block);
                             activity(summary);
-                            emit(`{cyan-fg}> ${summary}{/cyan-fg}`, 'tool');
+                            emit(`{cyan-fg}> ${escapeTags(summary)}{/cyan-fg}`, 'tool');
 
                             const fileOp = classifyFileOp(block.name, block.input);
                             if (fileOp) {
@@ -1153,7 +1154,7 @@ function runAgent(promptBody, ui, opts = {}) {
                             if ((block.name === 'Agent' || block.name === 'Task') && block.id) {
                                 const desc = block.input?.description || (block.input?.prompt || '').slice(0, 40) || 'agent';
                                 STATE.agentTree.children[block.id] = {
-                                    name: `{yellow-fg}▸{/yellow-fg} ${desc}`,
+                                    name: `{yellow-fg}▸{/yellow-fg} ${escapeTags(desc)}`,
                                     extended: false,
                                     children: {},
                                 };
@@ -1196,7 +1197,7 @@ function runAgent(promptBody, ui, opts = {}) {
                             const errText = typeof block.content === 'string'
                                 ? block.content
                                 : JSON.stringify(block.content);
-                            emit(`{red-fg}< ${errText.slice(0, 300)}{/red-fg}`, 'error');
+                            emit(`{red-fg}< ${escapeTags(errText.slice(0, 300))}{/red-fg}`, 'error');
                         }
                     }
                     break;
@@ -1212,7 +1213,7 @@ function runAgent(promptBody, ui, opts = {}) {
         }
 
         createInterface({ input: child.stderr }).on('line', line => {
-            emit(`{red-fg}! ${line}{/red-fg}`, 'error');
+            emit(`{red-fg}! ${escapeTags(line)}{/red-fg}`, 'error');
         });
 
         child.on('close', code => {
