@@ -719,7 +719,7 @@ function createUi(maxIters, prdPath) {
         STATE.waveLabel = `${wave.group || '—'} (${count} task${count !== 1 ? 's' : ''})`;
         STATE.agentTree = { name: `ralph — wave ${waveNum}: ${STATE.waveLabel}`, extended: true, children: {} };
         for (const t of wave.tasks) {
-            STATE.agentTree.children[t.id] = { name: ` {gray-fg}·{/gray-fg} ${t.id} ${t.title}`, extended: false, children: {} };
+            STATE.agentTree.children[t.id] = { name: ` {gray-fg}·{/gray-fg} ${t.id} ${escapeTags(t.title)}`, extended: false, children: {} };
         }
         agentTreeWidget.setData(STATE.agentTree);
         updateFilesTouched();
@@ -767,14 +767,27 @@ function createUi(maxIters, prdPath) {
             : `${task.id}: ${task.title}`;
     }
 
+    // blessed parses {...} as markup; a malformed tag (e.g. a path like
+    // lang/{es,ca,en}/x.php that slipped past escaping) makes its tag parser
+    // dereference null and throw, which would crash the whole run mid-task.
+    // Never let one log line take the TUI down: retry with braces neutralized,
+    // then give up on just that line.
+    function safeLog(widget, text) {
+        try {
+            widget.log(text);
+        } catch (_) {
+            try { widget.log(escapeTags(text)); } catch (_) { /* skip unrenderable line */ }
+        }
+    }
+
     function appendTaggedLine(text, category) {
         STATE.logEntries.push({ text, category });
         if (STATE.logEntries.length > MAX_LOG_ENTRIES) STATE.logEntries.shift();
 
         if (STATE.logFilter === 'all' || category === 'system' || STATE.logFilter === category) {
-            log.log(text);
-            logFull.log(text);
-            analyticsLog.log(text);
+            safeLog(log, text);
+            safeLog(logFull, text);
+            safeLog(analyticsLog, text);
         }
         screen.render();
     }
@@ -786,9 +799,9 @@ function createUi(maxIters, prdPath) {
 
         for (const entry of STATE.logEntries) {
             if (STATE.logFilter === 'all' || entry.category === 'system' || STATE.logFilter === entry.category) {
-                log.log(entry.text);
-                logFull.log(entry.text);
-                analyticsLog.log(entry.text);
+                safeLog(log, entry.text);
+                safeLog(logFull, entry.text);
+                safeLog(analyticsLog, entry.text);
             }
         }
         updateKeybindingsBar();
@@ -807,11 +820,11 @@ function createUi(maxIters, prdPath) {
 
         const items = tasks.map((task, i) => {
             if (task.done) {
-                return ` {green-fg}[x]{/green-fg} {green-fg}${task.id}{/green-fg} ${task.title}`;
+                return ` {green-fg}[x]{/green-fg} {green-fg}${task.id}{/green-fg} ${escapeTags(task.title)}`;
             } else if (i === currentIdx) {
-                return ` {yellow-fg}[>]{/yellow-fg} {bold}{yellow-fg}${task.id}{/yellow-fg}{/bold} ${task.title}`;
+                return ` {yellow-fg}[>]{/yellow-fg} {bold}{yellow-fg}${task.id}{/yellow-fg}{/bold} ${escapeTags(task.title)}`;
             }
-            return ` {gray-fg}[ ] ${task.id} ${task.title}{/gray-fg}`;
+            return ` {gray-fg}[ ] ${task.id} ${escapeTags(task.title)}{/gray-fg}`;
         });
 
         taskList.setItems(items);
