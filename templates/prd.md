@@ -296,7 +296,7 @@ One checklist per User Story. Each criterion should be binary (testable as pass/
 
 ### 16. Tasks (ralph.js compatible)
 
-Break the implementation plan into atomic tasks grouped into parallel waves. Each task is a single unit of work that an AI agent (`claude -p`) can complete in one iteration. **By default ralph runs the tasks in each `### Wn` group concurrently** — every task in a group is dispatched at once, each in its own isolated git worktree, then merged back one at a time with a test gate. Groups themselves run in document order. (Ralph falls back to a strictly sequential one-task-per-iteration loop when the project is not a git repo, the working tree is dirty, or no `### Wn` tasks are found — so the structure below also degrades gracefully.)
+Break the implementation plan into atomic, sequentially executable tasks. Each task is a single unit of work that an AI agent (`claude -p`) can complete in one iteration. ralph.js reads this file and drives `claude -p` in a loop — each iteration picks the highest-priority unchecked task, implements it, checks it off (`- [x]`), commits, and moves on.
 
 **Task format rules:**
 - Begin the section with a **level-2** heading exactly `## Tasks`. ralph.js only starts parsing tasks at a level-2 heading containing the word "Tasks" — a `### ...Tasks` sub-heading will NOT be detected, and the task panel will stay empty.
@@ -304,9 +304,6 @@ Break the implementation plan into atomic tasks grouped into parallel waves. Eac
 - Prefix each task with a unique ID: `**T1:**`, `**T2:**`, etc.
 - Group tasks under **level-3** wave/phase headers (`### W1: Foundation`, `### W2: Components`, etc.) — these stay at level-3 so they nest inside `## Tasks`.
 - Order tasks by dependency — earlier tasks must not depend on later ones
-- **Maximize wave width.** Tasks in the same `### Wn` group run *at the same time*, so each independent task you add to a group is free parallelism; every singleton group (one task) is a sequential bottleneck. Prefer a few **wide** groups of many independent tasks over a long chain of small groups. Only start a new group when later tasks genuinely depend on earlier ones.
-- **Parallel-safety (this is the default execution model):** because same-group tasks run **concurrently** in separate worktrees and are merged back one at a time, same-group tasks **MUST touch disjoint files** — no two tasks in one group may create, modify, or delete the same file (a shared file causes a merge conflict and forces a slow sequential retry). Cross-group dependencies are fine because groups run in order; intra-group dependencies are forbidden. If two tasks must edit the same file or one depends on the other, put them in **different** groups.
-- Do **not** have tasks edit the PRD/PROJECT file or `PROGRESS.md` themselves. In parallel mode ralph is the sole writer of task check-offs and progress entries (it records them after a successful merge); in the sequential fallback the agent still updates them per `PROMPT.md`.
 - Each task must be self-contained: state exactly which files to create, modify, or delete
 - Include the verification command at the end of each task (e.g., "Run `npm run build` to verify.")
 - Keep each task small enough for one `claude -p` iteration (create/modify 1–5 files)

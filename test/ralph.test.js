@@ -1,4 +1,4 @@
-import { describe, it, before, after } from 'node:test';
+import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -10,11 +10,8 @@ import {
     classifyFileOp, parseTestOutput, parseGitDiffStat,
     computeEta, computeBurnRate, summarizeToolUse,
     parsePrdTasksFromContent,
-    groupTasksIntoWaves, buildBranchName,
-    parallelFallbackReason, shouldRunParallel,
     escapeTags,
 } from '../lib/ralph-utils.js';
-import { parseArgs } from '../bin/ralph.js';
 
 describe('formatElapsed', () => {
     it('returns 00:00 for falsy input', () => {
@@ -456,151 +453,6 @@ Just prose, no tasks here.
     });
 });
 
-describe('groupTasksIntoWaves', () => {
-    const task = (id, group, done = false) => ({ id, title: id, group, done });
-
-    it('returns empty array for no tasks', () => {
-        assert.deepEqual(groupTasksIntoWaves([]), []);
-    });
-
-    it('groups same-group tasks into one wave and preserves group order', () => {
-        const tasks = [
-            task('T1', 'W1'), task('T2', 'W1'),
-            task('T3', 'W2'),
-        ];
-        const waves = groupTasksIntoWaves(tasks);
-        assert.equal(waves.length, 2);
-        assert.equal(waves[0].group, 'W1');
-        assert.deepEqual(waves[0].tasks.map(t => t.id), ['T1', 'T2']);
-        assert.equal(waves[1].group, 'W2');
-        assert.deepEqual(waves[1].tasks.map(t => t.id), ['T3']);
-    });
-
-    it('drops done tasks before forming waves', () => {
-        const tasks = [task('T1', 'W1', true), task('T2', 'W1'), task('T3', 'W2', true)];
-        const waves = groupTasksIntoWaves(tasks);
-        assert.equal(waves.length, 1);
-        assert.deepEqual(waves[0].tasks.map(t => t.id), ['T2']);
-    });
-
-    it('chunks an oversized group into back-to-back sub-waves of the same group', () => {
-        const tasks = Array.from({ length: 7 }, (_, n) => task(`T${n + 1}`, 'W1'));
-        const waves = groupTasksIntoWaves(tasks, 3);
-        assert.equal(waves.length, 3);
-        assert.deepEqual(waves.map(w => w.tasks.length), [3, 3, 1]);
-        assert.ok(waves.every(w => w.group === 'W1'));
-    });
-
-    it('makes each ungrouped task its own singleton wave', () => {
-        const tasks = [task('T1', ''), task('T2', '')];
-        const waves = groupTasksIntoWaves(tasks);
-        assert.equal(waves.length, 2);
-        assert.ok(waves.every(w => w.tasks.length === 1));
-    });
-
-    it('does not merge non-adjacent same-group tasks across an ungrouped one', () => {
-        const tasks = [task('T1', 'W1'), task('T2', ''), task('T3', 'W1')];
-        const waves = groupTasksIntoWaves(tasks);
-        assert.deepEqual(waves.map(w => w.tasks.map(t => t.id)), [['T1'], ['T2'], ['T3']]);
-    });
-});
-
-describe('parallelFallbackReason / shouldRunParallel', () => {
-    const ok = { requested: true, isGit: true, clean: true, taskCount: 3 };
-
-    it('returns null (runs parallel) when all preconditions hold', () => {
-        assert.equal(parallelFallbackReason(ok), null);
-        assert.equal(shouldRunParallel(ok), true);
-    });
-
-    it('falls back when parallel was not requested', () => {
-        const r = parallelFallbackReason({ ...ok, requested: false });
-        assert.match(r, /sequential requested/);
-        assert.equal(shouldRunParallel({ ...ok, requested: false }), false);
-    });
-
-    it('falls back when not a git repo', () => {
-        assert.match(parallelFallbackReason({ ...ok, isGit: false }), /not a git repo/);
-        assert.equal(shouldRunParallel({ ...ok, isGit: false }), false);
-    });
-
-    it('falls back when the working tree is dirty', () => {
-        assert.match(parallelFallbackReason({ ...ok, clean: false }), /dirty/);
-        assert.equal(shouldRunParallel({ ...ok, clean: false }), false);
-    });
-
-    it('falls back when there are no parseable tasks (the dangerous no-op case)', () => {
-        assert.match(parallelFallbackReason({ ...ok, taskCount: 0 }), /no parseable/);
-        assert.equal(shouldRunParallel({ ...ok, taskCount: 0 }), false);
-    });
-
-    it('checks git before tree-cleanliness when both fail', () => {
-        // not-git takes priority so the message points at the root cause.
-        assert.match(parallelFallbackReason({ ...ok, isGit: false, clean: false }), /not a git repo/);
-    });
-});
-
-describe('parseArgs (mode defaults)', () => {
-    let fixture, prevCwd;
-
-    before(() => {
-        fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-args-'));
-        fs.writeFileSync(path.join(fixture, 'PROMPT.md'), 'Work on @PROJECT.md\n');
-        fs.writeFileSync(path.join(fixture, 'PRD.md'), '# PRD\n');
-        prevCwd = process.cwd();
-        process.chdir(fixture);
-    });
-
-    after(() => {
-        process.chdir(prevCwd);
-        fs.rmSync(fixture, { recursive: true, force: true });
-    });
-
-    const parse = (...flags) => parseArgs(['node', 'ralph', 'PRD.md', ...flags]);
-
-    it('defaults to parallel mode', () => {
-        assert.equal(parse().parallel, true);
-    });
-
-    it('--sequential forces sequential', () => {
-        assert.equal(parse('--sequential').parallel, false);
-    });
-
-    it('--no-parallel is an alias for --sequential', () => {
-        assert.equal(parse('--no-parallel').parallel, false);
-    });
-
-    it('--parallel is an accepted no-op (stays parallel)', () => {
-        assert.equal(parse('--parallel').parallel, true);
-    });
-
-    it('--max-parallel does not override --sequential, regardless of order', () => {
-        assert.equal(parse('--sequential', '--max-parallel', '4').parallel, false);
-        assert.equal(parse('--max-parallel', '4', '--sequential').parallel, false);
-    });
-});
-
-describe('buildBranchName', () => {
-    it('slugifies the title', () => {
-        assert.equal(buildBranchName('T1', 'Create the User model'), 'ralph/T1-create-the-user-model');
-    });
-
-    it('collapses non-alphanumerics and trims dashes', () => {
-        assert.equal(buildBranchName('T2', '  Add /routes & wiring!! '), 'ralph/T2-add-routes-wiring');
-    });
-
-    it('falls back to id-only for an empty or symbol-only title', () => {
-        assert.equal(buildBranchName('T3', ''), 'ralph/T3');
-        assert.equal(buildBranchName('T4', '***'), 'ralph/T4');
-    });
-
-    it('caps slug length and uses only the safe charset', () => {
-        const name = buildBranchName('T5', 'x'.repeat(100));
-        assert.match(name, /^ralph\/T5-[a-z0-9-]+$/);
-        assert.ok(name.length <= 'ralph/T5-'.length + 40);
-    });
-});
-
 // ─── CLI Command Tests ──────────────────────────────────────────────────────
 
 const BIN = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'ralph.js');
@@ -694,38 +546,12 @@ describe('ralph CLI', () => {
         assert.equal(code, 2);
         assert.match(stderr, /requires a TTY/);
     });
-
-    it('documents --sequential and --max-parallel in help', () => {
-        const { code, stdout } = run('--help');
-        assert.equal(code, 0);
-        assert.match(stdout, /--sequential/);
-        assert.match(stdout, /--max-parallel/);
-        assert.match(stdout, /default/i);
-    });
-
-    it('accepts --parallel as a no-op alias (still fails on TTY)', () => {
-        const { code, stderr } = run('PROMPT.md', '--parallel');
-        assert.equal(code, 2);
-        assert.match(stderr, /requires a TTY/);
-    });
-
-    it('accepts --sequential with valid args (still fails on TTY)', () => {
-        const { code, stderr } = run('PROMPT.md', '--sequential');
-        assert.equal(code, 2);
-        assert.match(stderr, /requires a TTY/);
-    });
-
-    it('errors on --max-parallel with a non-positive value', () => {
-        const { code, stderr } = run('PROMPT.md', '--max-parallel', '0');
-        assert.equal(code, 2);
-        assert.match(stderr, /--max-parallel must be a positive integer/);
-    });
 });
 
 describe('ralph init', () => {
-    function runInitIn(cwd, ...args) {
+    function runInitIn(cwd) {
         try {
-            const stdout = execFileSync('node', [BIN, ...args], {
+            const stdout = execFileSync('node', [BIN, 'init'], {
                 encoding: 'utf8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'], cwd,
             });
             return { code: 0, stdout };
@@ -739,45 +565,16 @@ describe('ralph init', () => {
         const prompt = path.join(dir, 'PROMPT.md');
         const prd = path.join(dir, '.claude', 'commands', 'prd.md');
 
-        const first = runInitIn(dir, 'init');
+        const first = runInitIn(dir);
         assert.equal(first.code, 0);
         assert.ok(fs.existsSync(prompt), 'PROMPT.md created');
         assert.ok(fs.existsSync(prd), '.claude/commands/prd.md created');
         assert.match(fs.readFileSync(prd, 'utf8'), /^## Tasks$/m);
 
         fs.writeFileSync(prompt, 'CUSTOM');
-        const second = runInitIn(dir, 'init');
+        const second = runInitIn(dir);
         assert.equal(second.code, 0);
         assert.match(second.stdout, /skipped \(exists\)/);
         assert.equal(fs.readFileSync(prompt, 'utf8'), 'CUSTOM', 'existing file preserved');
-    });
-
-    it('update overwrites existing PROMPT.md and the /prd command', () => {
-        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-update-'));
-        const prompt = path.join(dir, 'PROMPT.md');
-        const prd = path.join(dir, '.claude', 'commands', 'prd.md');
-
-        assert.equal(runInitIn(dir, 'init').code, 0);
-        fs.writeFileSync(prompt, 'STALE');
-        fs.writeFileSync(prd, 'STALE');
-
-        const upd = runInitIn(dir, 'update');
-        assert.equal(upd.code, 0);
-        assert.match(upd.stdout, /updated:/);
-        assert.notEqual(fs.readFileSync(prompt, 'utf8'), 'STALE', 'PROMPT.md refreshed');
-        assert.match(fs.readFileSync(prd, 'utf8'), /^## Tasks$/m, '/prd command refreshed');
-    });
-
-    it('init --force also overwrites existing assets', () => {
-        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-force-'));
-        const prompt = path.join(dir, 'PROMPT.md');
-
-        assert.equal(runInitIn(dir, 'init').code, 0);
-        fs.writeFileSync(prompt, 'STALE');
-
-        const forced = runInitIn(dir, 'init', '--force');
-        assert.equal(forced.code, 0);
-        assert.match(forced.stdout, /updated:/);
-        assert.notEqual(fs.readFileSync(prompt, 'utf8'), 'STALE', 'PROMPT.md refreshed');
     });
 });
