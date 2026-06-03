@@ -468,10 +468,21 @@ function createUi(maxIters, prdPath) {
     agentTreeWidget.setData(STATE.agentTree);
     let agentTreeVisible = false;
 
-    const keybindingsBar = grid.set(15, 0, 1, 12, blessed.box, {
+    // Pinned to the absolute bottom line instead of being proportioned as the
+    // last row of the contrib.grid — contrib.grid rounds the bottom-most row to
+    // a thin strip that some terminals clip, so the footer could be invisible.
+    // An absolute bottom:0 box always lands on the last visible line. Appended
+    // after the grid so it draws on top; the now-unused grid row 15 sits empty
+    // beneath the bottom panels (history stays at rows 13–14, no overlap).
+    const keybindingsBar = blessed.box({
+        bottom: 0,
+        left: 0,
+        width: '100%',
+        height: 1,
         tags: true,
         style: { fg: 'white' },
     });
+    screen.append(keybindingsBar);
 
     // ── Standard mode panels ──
 
