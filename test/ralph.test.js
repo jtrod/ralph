@@ -1,4 +1,4 @@
-import { describe, it } from 'node:test';
+import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -11,7 +11,9 @@ import {
     computeEta, computeBurnRate, summarizeToolUse,
     parsePrdTasksFromContent,
     groupTasksIntoWaves, buildBranchName,
+    parallelFallbackReason, shouldRunParallel,
 } from '../lib/ralph-utils.js';
+import { parseArgs } from '../bin/ralph.js';
 
 describe('formatElapsed', () => {
     it('returns 00:00 for falsy input', () => {
@@ -453,6 +455,81 @@ describe('groupTasksIntoWaves', () => {
     });
 });
 
+describe('parallelFallbackReason / shouldRunParallel', () => {
+    const ok = { requested: true, isGit: true, clean: true, taskCount: 3 };
+
+    it('returns null (runs parallel) when all preconditions hold', () => {
+        assert.equal(parallelFallbackReason(ok), null);
+        assert.equal(shouldRunParallel(ok), true);
+    });
+
+    it('falls back when parallel was not requested', () => {
+        const r = parallelFallbackReason({ ...ok, requested: false });
+        assert.match(r, /sequential requested/);
+        assert.equal(shouldRunParallel({ ...ok, requested: false }), false);
+    });
+
+    it('falls back when not a git repo', () => {
+        assert.match(parallelFallbackReason({ ...ok, isGit: false }), /not a git repo/);
+        assert.equal(shouldRunParallel({ ...ok, isGit: false }), false);
+    });
+
+    it('falls back when the working tree is dirty', () => {
+        assert.match(parallelFallbackReason({ ...ok, clean: false }), /dirty/);
+        assert.equal(shouldRunParallel({ ...ok, clean: false }), false);
+    });
+
+    it('falls back when there are no parseable tasks (the dangerous no-op case)', () => {
+        assert.match(parallelFallbackReason({ ...ok, taskCount: 0 }), /no parseable/);
+        assert.equal(shouldRunParallel({ ...ok, taskCount: 0 }), false);
+    });
+
+    it('checks git before tree-cleanliness when both fail', () => {
+        // not-git takes priority so the message points at the root cause.
+        assert.match(parallelFallbackReason({ ...ok, isGit: false, clean: false }), /not a git repo/);
+    });
+});
+
+describe('parseArgs (mode defaults)', () => {
+    let fixture, prevCwd;
+
+    before(() => {
+        fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-args-'));
+        fs.writeFileSync(path.join(fixture, 'PROMPT.md'), 'Work on @PROJECT.md\n');
+        fs.writeFileSync(path.join(fixture, 'PRD.md'), '# PRD\n');
+        prevCwd = process.cwd();
+        process.chdir(fixture);
+    });
+
+    after(() => {
+        process.chdir(prevCwd);
+        fs.rmSync(fixture, { recursive: true, force: true });
+    });
+
+    const parse = (...flags) => parseArgs(['node', 'ralph', 'PRD.md', ...flags]);
+
+    it('defaults to parallel mode', () => {
+        assert.equal(parse().parallel, true);
+    });
+
+    it('--sequential forces sequential', () => {
+        assert.equal(parse('--sequential').parallel, false);
+    });
+
+    it('--no-parallel is an alias for --sequential', () => {
+        assert.equal(parse('--no-parallel').parallel, false);
+    });
+
+    it('--parallel is an accepted no-op (stays parallel)', () => {
+        assert.equal(parse('--parallel').parallel, true);
+    });
+
+    it('--max-parallel does not override --sequential, regardless of order', () => {
+        assert.equal(parse('--sequential', '--max-parallel', '4').parallel, false);
+        assert.equal(parse('--max-parallel', '4', '--sequential').parallel, false);
+    });
+});
+
 describe('buildBranchName', () => {
     it('slugifies the title', () => {
         assert.equal(buildBranchName('T1', 'Create the User model'), 'ralph/T1-create-the-user-model');
@@ -568,15 +645,22 @@ describe('ralph CLI', () => {
         assert.match(stderr, /requires a TTY/);
     });
 
-    it('documents --parallel in help', () => {
+    it('documents --sequential and --max-parallel in help', () => {
         const { code, stdout } = run('--help');
         assert.equal(code, 0);
-        assert.match(stdout, /--parallel/);
+        assert.match(stdout, /--sequential/);
         assert.match(stdout, /--max-parallel/);
+        assert.match(stdout, /default/i);
     });
 
-    it('accepts --parallel with valid args (still fails on TTY)', () => {
+    it('accepts --parallel as a no-op alias (still fails on TTY)', () => {
         const { code, stderr } = run('PROMPT.md', '--parallel');
+        assert.equal(code, 2);
+        assert.match(stderr, /requires a TTY/);
+    });
+
+    it('accepts --sequential with valid args (still fails on TTY)', () => {
+        const { code, stderr } = run('PROMPT.md', '--sequential');
         assert.equal(code, 2);
         assert.match(stderr, /requires a TTY/);
     });

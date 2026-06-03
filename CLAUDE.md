@@ -13,8 +13,9 @@ npm test                      # run the full test suite (node --test)
 node --test test/ralph.test.js   # run one test file
 npm install                   # also runs bin/setup.js postinstall (scaffolds PROMPT.md + /prd)
 
-ralph <prd-file> [iterations=10] [--budget <usd>]   # start the sequential loop (needs a real TTY)
-ralph <prd-file> --parallel [--max-parallel <n>]    # run each ### Wn work group as a concurrent wave
+ralph <prd-file> [iterations=10] [--budget <usd>]   # start the loop, parallel by default (needs a real TTY)
+ralph <prd-file> --sequential                       # force the one-task-per-iteration loop (--no-parallel alias)
+ralph <prd-file> [--max-parallel <n>]               # cap concurrent agents per ### Wn wave (default 6)
 ralph init                    # scaffold PROMPT.md and .claude/commands/prd.md, then exit
 ```
 
@@ -33,7 +34,9 @@ Both the sequential loop and the parallel scheduler spawn agents through one sha
 
 **Loop termination (sequential)** is decided in `runLoop` by inspecting each iteration's result, in priority order: spawn error → user-canceled → user-skipped → non-zero exit → `<promise>COMPLETE</promise>` token in output (regex `COMPLETE_TOKEN`) → budget exceeded (pauses, does not exit) → max iterations.
 
-**Parallel mode** (`--parallel`, `runWaves`): `groupTasksIntoWaves` (in `lib/ralph-utils.js`) partitions not-yet-done tasks into waves — same `### Wn` group = one wave, groups run in order, oversized groups chunked to the `--max-parallel` cap. Each multi-task wave creates one git worktree+branch per task under `.ralph/worktrees/<taskId>` (ignored via `.git/info/exclude`), runs all agents with `Promise.all`, then merges each branch back to the base branch **one at a time** (`mergeBranch`), running `npm test` after each merge when a test script exists. A merge conflict or test failure rolls the task back (`git merge --abort` / `reset --hard`) and re-queues it to run solo. **Ralph owns all PRD check-offs and `PROGRESS.md` writes** (`recordTaskDone`) — the parallel agent prompt (`buildParallelPrompt`) explicitly forbids agents from touching those files or pushing. Termination: all tasks checked off → `complete`; a task that fails even after a solo retry → `task-failed`; non-git or dirty tree → `not-git`/`dirty-tree`. Worktrees are cleaned up after every wave and on quit/crash (`cleanupWave`).
+**Mode selection** is decided in `main()`: parallel is the **default**, but `parallelFallbackReason` (in `lib/ralph-utils.js`) downgrades to the sequential loop — emitting a yellow `[notice: … — running sequentially]` line — when the cwd is not a git repo, the working tree is dirty, or the PRD yields zero parseable tasks (which would otherwise make `runWaves` no-op as instantly "complete"). `--sequential`/`--no-parallel` forces sequential; `--parallel` is an accepted no-op alias. `maxIters` only bounds the sequential loop — `runWaves` runs every wave once.
+
+**Parallel mode** (`runWaves`, the default): `groupTasksIntoWaves` (in `lib/ralph-utils.js`) partitions not-yet-done tasks into waves — same `### Wn` group = one wave, groups run in order, oversized groups chunked to the `--max-parallel` cap. Each multi-task wave creates one git worktree+branch per task under `.ralph/worktrees/<taskId>` (ignored via `.git/info/exclude`), runs all agents with `Promise.all`, then merges each branch back to the base branch **one at a time** (`mergeBranch`), running `npm test` after each merge when a test script exists. A merge conflict or test failure rolls the task back (`git merge --abort` / `reset --hard`) and re-queues it to run solo. **Ralph owns all PRD check-offs and `PROGRESS.md` writes** (`recordTaskDone`) — the parallel agent prompt (`buildParallelPrompt`) explicitly forbids agents from touching those files or pushing. Termination: all tasks checked off → `complete`; a task that fails even after a solo retry → `task-failed`; non-git or dirty tree → `not-git`/`dirty-tree`. Worktrees are cleaned up after every wave and on quit/crash (`cleanupWave`).
 
 ### Two things drive the agent's behavior
 

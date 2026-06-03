@@ -14,6 +14,7 @@ import {
     computeEta, computeBurnRate, summarizeToolUse,
     parsePrdTasksFromContent,
     groupTasksIntoWaves, buildBranchName, DEFAULT_WAVE_CAP,
+    parallelFallbackReason,
     TASK_LINE_RE, CHECKBOX_LINE_RE,
 } from '../lib/ralph-utils.js';
 
@@ -33,7 +34,7 @@ const STATE = {
     canceled: false,
     skipped: false,
     paused: false,
-    parallel: false,
+    parallel: true,
     maxParallel: 0,
     wave: null,
     waveLabel: '',
@@ -71,7 +72,7 @@ const STATE = {
 // ─── CLI ────────────────────────────────────────────────────────────────────
 
 function printUsage(stream) {
-    (stream ?? process.stdout).write(`Usage: ralph <prd-file> [iterations=10] [--budget <usd>] [--parallel]
+    (stream ?? process.stdout).write(`Usage: ralph <prd-file> [iterations=10] [--budget <usd>] [--sequential]
        ralph init
 
 Drive an iterative claude -p loop against a PRD file with a live TUI.
@@ -82,18 +83,22 @@ Commands:
 
 Arguments:
   <prd-file>    Path to the PRD/project file the agent will read and update.
-  iterations    Max iterations before giving up (sequential mode). Default: 10.
+  iterations    Max iterations before giving up. Sequential mode only —
+                parallel mode runs every work-group wave once and ignores
+                this value. Default: 10.
 
 Options:
   --budget <n>       Max USD to spend. Auto-pauses when exceeded.
-  --parallel         Run each work group (### Wn) as a concurrent wave: tasks
-                     in a group run at once in isolated git worktrees, then
-                     merge back one at a time with a test gate. Requires a git
-                     repo and a clean working tree. Same-group tasks must touch
-                     disjoint files. Default is sequential.
-  --max-parallel <n> Cap concurrent agents per wave (implies --parallel).
-                     Default: ${DEFAULT_WAVE_CAP}.
+  --sequential       Force the one-task-per-iteration loop instead of parallel
+                     waves. (--no-parallel is an alias.)
+  --max-parallel <n> Cap concurrent agents per wave. Default: ${DEFAULT_WAVE_CAP}.
   -h, --help         Print this help and exit.
+
+Parallel mode (default): each work group (### Wn) runs as a concurrent wave —
+tasks in a group run at once in isolated git worktrees, then merge back one at
+a time with a test gate. Same-group tasks must touch disjoint files. Ralph
+falls back to sequential automatically when the project is not a git repo, the
+working tree is dirty, or the PRD has no parseable ### Wn tasks.
 
 Keys (inside the TUI):
   q  Quit           c  Cancel iteration    s  Skip iteration
@@ -129,7 +134,7 @@ function parseArgs(argv) {
     if (raw.includes('-h') || raw.includes('--help')) return { help: true };
 
     let budget = null;
-    let parallel = false;
+    let parallel = true;
     let maxParallel = DEFAULT_WAVE_CAP;
     const positional = [];
 
@@ -141,7 +146,12 @@ function parseArgs(argv) {
             }
             continue;
         }
+        if (raw[i] === '--sequential' || raw[i] === '--no-parallel') {
+            parallel = false;
+            continue;
+        }
         if (raw[i] === '--parallel') {
+            // Parallel is the default; accepted as a no-op alias for back-compat.
             parallel = true;
             continue;
         }
@@ -150,7 +160,8 @@ function parseArgs(argv) {
             if (!Number.isInteger(maxParallel) || maxParallel <= 0) {
                 return { error: `--max-parallel must be a positive integer, got: ${raw[i]}` };
             }
-            parallel = true;
+            // Parallel is already the default; don't override an explicit
+            // --sequential just because a cap was also passed.
             continue;
         }
         positional.push(raw[i]);
@@ -1656,9 +1667,35 @@ function main() {
     STATE.sessionStartedAt = Date.now();
     STATE.tasks = parsePrdTasks(args.prdPath);
 
+    // Parallel is the default, but it needs a clean git tree and parseable
+    // ### Wn tasks. When those preconditions don't hold, fall back to the
+    // sequential loop rather than hard-erroring (not-git/dirty) or silently
+    // no-opping (zero tasks). The notice is surfaced in the UI once it exists.
+    let parallelFallbackNotice = null;
+    if (STATE.parallel) {
+        const cwd = process.cwd();
+        parallelFallbackNotice = parallelFallbackReason({
+            requested: true,
+            isGit: isGitRepo(cwd),
+            clean: isWorkingTreeClean(cwd),
+            // Total parseable tasks, not just pending: a PRD whose tasks are all
+            // checked off still has a valid ### Wn structure — let runWaves
+            // short-circuit to "complete" rather than mislabeling it as prose.
+            taskCount: STATE.tasks.length,
+        });
+        if (parallelFallbackNotice) STATE.parallel = false;
+    }
+
     const promptBody = buildPromptBody(args.prdPath);
     const ui = createUi(args.maxIters, args.prdPath);
     STATE.ui = ui;
+
+    if (parallelFallbackNotice) {
+        ui.appendTaggedLine(
+            `{yellow-fg}[notice: ${parallelFallbackNotice} — running sequentially]{/yellow-fg}`,
+            'system',
+        );
+    }
 
     ui.updateTaskList(STATE.tasks);
     ui.updateHistory();
@@ -1708,4 +1745,4 @@ const invokedDirectly = (() => {
 })();
 if (invokedDirectly) main();
 
-export { runWaves, STATE };
+export { runWaves, STATE, parseArgs };
