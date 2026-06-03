@@ -673,9 +673,9 @@ describe('ralph CLI', () => {
 });
 
 describe('ralph init', () => {
-    function runInitIn(cwd) {
+    function runInitIn(cwd, ...args) {
         try {
-            const stdout = execFileSync('node', [BIN, 'init'], {
+            const stdout = execFileSync('node', [BIN, ...args], {
                 encoding: 'utf8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'], cwd,
             });
             return { code: 0, stdout };
@@ -689,16 +689,45 @@ describe('ralph init', () => {
         const prompt = path.join(dir, 'PROMPT.md');
         const prd = path.join(dir, '.claude', 'commands', 'prd.md');
 
-        const first = runInitIn(dir);
+        const first = runInitIn(dir, 'init');
         assert.equal(first.code, 0);
         assert.ok(fs.existsSync(prompt), 'PROMPT.md created');
         assert.ok(fs.existsSync(prd), '.claude/commands/prd.md created');
         assert.match(fs.readFileSync(prd, 'utf8'), /^## Tasks$/m);
 
         fs.writeFileSync(prompt, 'CUSTOM');
-        const second = runInitIn(dir);
+        const second = runInitIn(dir, 'init');
         assert.equal(second.code, 0);
         assert.match(second.stdout, /skipped \(exists\)/);
         assert.equal(fs.readFileSync(prompt, 'utf8'), 'CUSTOM', 'existing file preserved');
+    });
+
+    it('update overwrites existing PROMPT.md and the /prd command', () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-update-'));
+        const prompt = path.join(dir, 'PROMPT.md');
+        const prd = path.join(dir, '.claude', 'commands', 'prd.md');
+
+        assert.equal(runInitIn(dir, 'init').code, 0);
+        fs.writeFileSync(prompt, 'STALE');
+        fs.writeFileSync(prd, 'STALE');
+
+        const upd = runInitIn(dir, 'update');
+        assert.equal(upd.code, 0);
+        assert.match(upd.stdout, /updated:/);
+        assert.notEqual(fs.readFileSync(prompt, 'utf8'), 'STALE', 'PROMPT.md refreshed');
+        assert.match(fs.readFileSync(prd, 'utf8'), /^## Tasks$/m, '/prd command refreshed');
+    });
+
+    it('init --force also overwrites existing assets', () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-force-'));
+        const prompt = path.join(dir, 'PROMPT.md');
+
+        assert.equal(runInitIn(dir, 'init').code, 0);
+        fs.writeFileSync(prompt, 'STALE');
+
+        const forced = runInitIn(dir, 'init', '--force');
+        assert.equal(forced.code, 0);
+        assert.match(forced.stdout, /updated:/);
+        assert.notEqual(fs.readFileSync(prompt, 'utf8'), 'STALE', 'PROMPT.md refreshed');
     });
 });

@@ -21,6 +21,30 @@ See [ralph-prd.md](ralph-prd.md) for detailed documentation.
    npx ralph example_prd.md
    ```
 
+   On first install, Ralph scaffolds two template-managed assets into your project:
+   `PROMPT.md` (the sequential-mode prompt) and `.claude/commands/prd.md` (the `/prd`
+   slash command).
+
+## Updating
+
+Pulling a newer version of the package **does not** refresh the scaffolded assets — the
+postinstall step only creates files that are missing, so it never clobbers your edits.
+After upgrading, run `ralph update` to overwrite `PROMPT.md` and the `/prd` command with
+the new version's templates:
+
+```bash
+npm install github:jtrod/ralph   # pull the latest package
+npx ralph update                 # refresh PROMPT.md + the /prd command
+```
+
+`ralph update` **overwrites** both files, so if you've customized `PROMPT.md`, commit it
+first (or stash it) and re-apply your changes afterward — `git diff PROMPT.md` makes that
+easy. The `/prd` command (`.claude/commands/prd.md`) is normally left untouched by you, so
+refreshing it is what keeps the generated PRDs aligned with the latest parallel-wave format.
+
+> `ralph init --force` does the same thing as `ralph update`. Plain `ralph init` still only
+> creates missing files and leaves existing ones alone.
+
 ## Usage
 
 ```bash

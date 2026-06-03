@@ -16,7 +16,8 @@ npm install                   # also runs bin/setup.js postinstall (scaffolds PR
 ralph <prd-file> [iterations=10] [--budget <usd>]   # start the loop, parallel by default (needs a real TTY)
 ralph <prd-file> --sequential                       # force the one-task-per-iteration loop (--no-parallel alias)
 ralph <prd-file> [--max-parallel <n>]               # cap concurrent agents per ### Wn wave (default 6)
-ralph init                    # scaffold PROMPT.md and .claude/commands/prd.md, then exit
+ralph init                    # scaffold PROMPT.md and .claude/commands/prd.md (skips existing), then exit
+ralph update                  # overwrite PROMPT.md + /prd command with this version's templates (alias: init --force)
 ```
 
 There is no build step, linter, or transpiler — this is plain Node ESM (`"type": "module"`, Node >= 18). Tests use the built-in `node:test` runner. `test/ralph.test.js` covers the pure functions in `lib/ralph-utils.js` plus CLI arg handling; `test/parallel.test.js` drives the `runWaves` scheduler end-to-end against a fake `claude` on `PATH` in throwaway git repos (the module exports `runWaves`/`STATE` and only runs `main()` when invoked directly, so it can be imported by tests). The blessed TUI itself is not unit-tested.
@@ -46,7 +47,9 @@ Both the sequential loop and the parallel scheduler spawn agents through one sha
 
 ### Scaffolding
 
-`bin/setup.js` (npm `postinstall`) and `ralph init` both copy `templates/PROMPT.md` → cwd and `templates/prd.md` → `.claude/commands/prd.md` (the `/prd` slash command). `setup.js` walks up out of `node_modules` to find the consuming project root and fails silently so it never breaks `npm install`; `runInit` is the explicit, verbose equivalent.
+`bin/setup.js` (npm `postinstall`) and `ralph init` both copy `templates/PROMPT.md` → cwd and `templates/prd.md` → `.claude/commands/prd.md` (the `/prd` slash command). Both **skip files that already exist**, so neither a re-install nor a re-run ever clobbers user edits — which also means **upgrading the package does not refresh the scaffolded assets**. `setup.js` walks up out of `node_modules` to find the consuming project root and fails silently so it never breaks `npm install`; `runInit(force)` is the explicit, verbose equivalent.
+
+`ralph update` (and `ralph init --force`) call `runInit(true)`, which **overwrites** `PROMPT.md` and the `/prd` command with the installed version's templates — this is the supported way to pull template changes (e.g. an updated parallel-wave PRD format) into an existing project after upgrading. The `update`/`--force` dispatch lives in `main()`; `copyTemplate(name, dest, force)` prints `created` / `updated` / `skipped (exists)` accordingly. The postinstall hook deliberately never forces, to avoid silently discarding a customized `PROMPT.md` on every `npm install`.
 
 **`ralph.sh`** is a minimal headless fallback (no TUI, no cost tracking) for CI / non-TTY environments — `bin/ralph.js` hard-exits if `stdout` is not a TTY.
 

@@ -73,13 +73,18 @@ const STATE = {
 
 function printUsage(stream) {
     (stream ?? process.stdout).write(`Usage: ralph <prd-file> [iterations=10] [--budget <usd>] [--sequential]
-       ralph init
+       ralph init [--force]
+       ralph update
 
 Drive an iterative claude -p loop against a PRD file with a live TUI.
 
 Commands:
   init          Scaffold PROMPT.md and install the /prd command into the
-                current project (.claude/commands/prd.md), then exit.
+                current project (.claude/commands/prd.md), then exit. Existing
+                files are left untouched (pass --force to overwrite them).
+  update        Overwrite PROMPT.md and the /prd command with this version's
+                templates, then exit. Run after upgrading the package — a
+                re-install alone does not refresh these assets.
 
 Arguments:
   <prd-file>    Path to the PRD/project file the agent will read and update.
@@ -108,25 +113,32 @@ Keys (inside the TUI):
 `);
 }
 
-function copyTemplate(templateName, destPath) {
-    if (fs.existsSync(destPath)) {
+function copyTemplate(templateName, destPath, force = false) {
+    const existed = fs.existsSync(destPath);
+    if (existed && !force) {
         process.stdout.write(`  skipped (exists): ${destPath}\n`);
         return;
     }
     fs.mkdirSync(path.dirname(destPath), { recursive: true });
     fs.copyFileSync(path.join(TEMPLATES_DIR, templateName), destPath);
-    process.stdout.write(`  created: ${destPath}\n`);
+    process.stdout.write(`  ${existed ? 'updated' : 'created'}: ${destPath}\n`);
 }
 
-function runInit() {
-    process.stdout.write('Scaffolding Ralph into the current project...\n');
-    copyTemplate('PROMPT.md', path.resolve('PROMPT.md'));
-    copyTemplate('prd.md', path.resolve('.claude', 'commands', 'prd.md'));
-    process.stdout.write(
-        '\nNext steps:\n' +
-        '  1. Run /prd in Claude Code to generate a ralph-compatible PROJECT.md\n' +
-        '  2. ralph PROJECT.md        # start the loop\n',
-    );
+// force=false (init): scaffold only the files that don't exist yet, so user
+// edits are never clobbered. force=true (update): overwrite the template-managed
+// assets (PROMPT.md and the /prd command) so they match the installed version —
+// re-installing the package alone does not refresh them.
+function runInit(force = false) {
+    process.stdout.write(force
+        ? 'Updating Ralph assets in the current project...\n'
+        : 'Scaffolding Ralph into the current project...\n');
+    copyTemplate('PROMPT.md', path.resolve('PROMPT.md'), force);
+    copyTemplate('prd.md', path.resolve('.claude', 'commands', 'prd.md'), force);
+    process.stdout.write(force
+        ? '\nPROMPT.md and the /prd command now match this version of Ralph.\n'
+        : '\nNext steps:\n' +
+          '  1. Run /prd in Claude Code to generate a ralph-compatible PROJECT.md\n' +
+          '  2. ralph PROJECT.md        # start the loop\n');
 }
 
 function parseArgs(argv) {
@@ -1636,8 +1648,10 @@ function registerSignalHandlers() {
 // ─── Entry Point ────────────────────────────────────────────────────────────
 
 function main() {
-    if (process.argv[2] === 'init') {
-        runInit();
+    if (process.argv[2] === 'init' || process.argv[2] === 'update') {
+        const force = process.argv[2] === 'update'
+            || process.argv.includes('--force') || process.argv.includes('-f');
+        runInit(force);
         process.exit(0);
     }
 
